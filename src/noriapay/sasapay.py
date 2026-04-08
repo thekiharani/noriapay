@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, NotRequired, TypedDict
 
-import requests
+import httpx
 
 from .config import (
     get_env_environment,
@@ -12,10 +12,11 @@ from .config import (
     get_required_env,
 )
 from .exceptions import ConfigurationError
-from .http import HttpClient
-from .oauth import ClientCredentialsTokenProvider
+from .http import AsyncHttpClient, HttpClient
+from .oauth import AsyncClientCredentialsTokenProvider, ClientCredentialsTokenProvider
 from .types import (
     AccessTokenProvider,
+    AsyncAccessTokenProvider,
     Environment,
     Hooks,
     HttpRequestOptions,
@@ -24,7 +25,7 @@ from .types import (
 )
 from .utils import to_amount_string
 
-SASAPAY_SANDBOX_BASE_URL = "https://sandbox.sasapay.app/api/v1"
+SASAPAY_BASE_URL = "https://sandbox.sasapay.app/api/v1"
 
 
 class SasaPayAuthResponse(TypedDict, total=False):
@@ -179,11 +180,12 @@ class SasaPayClient:
     def from_env(
         cls,
         *,
-        prefix: str = "NORIAPAY_SASAPAY_",
+        prefix: str = "SASAPAY_",
         environ: Mapping[str, str] | None = None,
         token_provider: AccessTokenProvider | None = None,
-        session: requests.Session | Any | None = None,
-        default_headers: dict[str, str] | None = None,
+        client: httpx.Client | Any | None = None,
+        session: httpx.Client | Any | None = None,
+        default_headers: Mapping[str, str] | None = None,
         retry: RetryPolicy | None = None,
         hooks: Hooks | None = None,
     ) -> SasaPayClient:
@@ -201,6 +203,7 @@ class SasaPayClient:
             token_provider=token_provider,
             environment=get_env_environment(f"{prefix}ENVIRONMENT", environ=environ),
             base_url=get_optional_env(f"{prefix}BASE_URL", environ=environ),
+            client=client,
             session=session,
             timeout_seconds=get_env_float(f"{prefix}TIMEOUT_SECONDS", environ=environ),
             token_cache_skew_seconds=(
@@ -219,17 +222,25 @@ class SasaPayClient:
         token_provider: AccessTokenProvider | None = None,
         environment: Environment = "sandbox",
         base_url: str | None = None,
-        session: requests.Session | Any | None = None,
+        client: httpx.Client | Any | None = None,
+        session: httpx.Client | Any | None = None,
         timeout_seconds: float | None = None,
         token_cache_skew_seconds: float = 60.0,
-        default_headers: dict[str, str] | None = None,
+        default_headers: Mapping[str, str] | None = None,
         retry: RetryPolicy | None = None,
         hooks: Hooks | None = None,
     ) -> None:
+        resolved_client = _resolve_sync_client(client, session)
+        self._client = resolved_client
+        self._owns_client = False
+        if self._client is None:
+            self._client = httpx.Client()
+            self._owns_client = True
+
         resolved_base_url = _resolve_sasapay_base_url(environment=environment, base_url=base_url)
         self._http = HttpClient(
             base_url=resolved_base_url,
-            session=session,
+            client=self._client,
             timeout_seconds=timeout_seconds,
             default_headers=default_headers,
             retry=retry,
@@ -239,7 +250,7 @@ class SasaPayClient:
             token_provider=token_provider,
             client_id=client_id,
             client_secret=client_secret,
-            session=session,
+            client=self._client,
             timeout_seconds=timeout_seconds,
             token_cache_skew_seconds=token_cache_skew_seconds,
             base_url=resolved_base_url,
@@ -272,7 +283,9 @@ class SasaPayClient:
         options: RequestOptions | None = None,
     ) -> SasaPayB2CResponse:
         return self._authorized_request(
-            "/payments/b2c/", _with_amount(payload, ("Amount",)), options
+            "/payments/b2c/",
+            _with_amount(payload, ("Amount",)),
+            options,
         )
 
     def b2b_payment(
@@ -281,8 +294,20 @@ class SasaPayClient:
         options: RequestOptions | None = None,
     ) -> SasaPayB2BResponse:
         return self._authorized_request(
-            "/payments/b2b/", _with_amount(payload, ("Amount",)), options
+            "/payments/b2b/",
+            _with_amount(payload, ("Amount",)),
+            options,
         )
+
+    def close(self) -> None:
+        if self._owns_client and self._client is not None:
+            self._client.close()
+
+    def __enter__(self) -> SasaPayClient:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
 
     def _authorized_request(
         self,
@@ -298,7 +323,162 @@ class SasaPayClient:
         headers["authorization"] = f"Bearer {access_token}"
         headers["accept"] = "application/json"
         return self._http.request(
-            options=HttpRequestOptions(
+            HttpRequestOptions(
+                path=path,
+                method="POST",
+                headers=headers,
+                body=payload,
+                timeout_seconds=request_options.timeout_seconds,
+                retry=request_options.retry,
+            )
+        )
+
+
+class AsyncSasaPayClient:
+    @classmethod
+    def from_env(
+        cls,
+        *,
+        prefix: str = "SASAPAY_",
+        environ: Mapping[str, str] | None = None,
+        token_provider: AsyncAccessTokenProvider | None = None,
+        client: httpx.AsyncClient | Any | None = None,
+        default_headers: Mapping[str, str] | None = None,
+        retry: RetryPolicy | None = None,
+        hooks: Hooks | None = None,
+    ) -> AsyncSasaPayClient:
+        return cls(
+            client_id=(
+                None
+                if token_provider is not None
+                else get_required_env(f"{prefix}CLIENT_ID", environ=environ)
+            ),
+            client_secret=(
+                None
+                if token_provider is not None
+                else get_required_env(f"{prefix}CLIENT_SECRET", environ=environ)
+            ),
+            token_provider=token_provider,
+            environment=get_env_environment(f"{prefix}ENVIRONMENT", environ=environ),
+            base_url=get_optional_env(f"{prefix}BASE_URL", environ=environ),
+            client=client,
+            timeout_seconds=get_env_float(f"{prefix}TIMEOUT_SECONDS", environ=environ),
+            token_cache_skew_seconds=(
+                get_env_float(f"{prefix}TOKEN_CACHE_SKEW_SECONDS", environ=environ) or 60.0
+            ),
+            default_headers=default_headers,
+            retry=retry,
+            hooks=hooks,
+        )
+
+    def __init__(
+        self,
+        *,
+        client_id: str | None = None,
+        client_secret: str | None = None,
+        token_provider: AsyncAccessTokenProvider | None = None,
+        environment: Environment = "sandbox",
+        base_url: str | None = None,
+        client: httpx.AsyncClient | Any | None = None,
+        timeout_seconds: float | None = None,
+        token_cache_skew_seconds: float = 60.0,
+        default_headers: Mapping[str, str] | None = None,
+        retry: RetryPolicy | None = None,
+        hooks: Hooks | None = None,
+    ) -> None:
+        self._client = client
+        self._owns_client = False
+        if self._client is None:
+            self._client = httpx.AsyncClient()
+            self._owns_client = True
+
+        resolved_base_url = _resolve_sasapay_base_url(environment=environment, base_url=base_url)
+        self._http = AsyncHttpClient(
+            base_url=resolved_base_url,
+            client=self._client,
+            timeout_seconds=timeout_seconds,
+            default_headers=default_headers,
+            retry=retry,
+            hooks=hooks,
+        )
+        self._tokens = _resolve_async_sasapay_token_provider(
+            token_provider=token_provider,
+            client_id=client_id,
+            client_secret=client_secret,
+            client=self._client,
+            timeout_seconds=timeout_seconds,
+            token_cache_skew_seconds=token_cache_skew_seconds,
+            base_url=resolved_base_url,
+        )
+
+    async def get_access_token(self, force_refresh: bool = False) -> str:
+        return await self._tokens.get_access_token(force_refresh=force_refresh)
+
+    async def request_payment(
+        self,
+        payload: SasaPayRequestPaymentRequest,
+        options: RequestOptions | None = None,
+    ) -> SasaPayRequestPaymentResponse:
+        return await self._authorized_request(
+            "/payments/request-payment/",
+            _with_amount(payload, ("Amount",)),
+            options,
+        )
+
+    async def process_payment(
+        self,
+        payload: SasaPayProcessPaymentRequest,
+        options: RequestOptions | None = None,
+    ) -> SasaPayProcessPaymentResponse:
+        return await self._authorized_request("/payments/process-payment/", dict(payload), options)
+
+    async def b2c_payment(
+        self,
+        payload: SasaPayB2CRequest,
+        options: RequestOptions | None = None,
+    ) -> SasaPayB2CResponse:
+        return await self._authorized_request(
+            "/payments/b2c/",
+            _with_amount(payload, ("Amount",)),
+            options,
+        )
+
+    async def b2b_payment(
+        self,
+        payload: SasaPayB2BRequest,
+        options: RequestOptions | None = None,
+    ) -> SasaPayB2BResponse:
+        return await self._authorized_request(
+            "/payments/b2b/",
+            _with_amount(payload, ("Amount",)),
+            options,
+        )
+
+    async def aclose(self) -> None:
+        if self._owns_client and self._client is not None:
+            await self._client.aclose()
+
+    async def __aenter__(self) -> AsyncSasaPayClient:
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        await self.aclose()
+
+    async def _authorized_request(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        options: RequestOptions | None,
+    ) -> Any:
+        request_options = options or RequestOptions()
+        access_token = request_options.access_token or await self._tokens.get_access_token(
+            force_refresh=request_options.force_token_refresh
+        )
+        headers = dict(request_options.headers or {})
+        headers["authorization"] = f"Bearer {access_token}"
+        headers["accept"] = "application/json"
+        return await self._http.request(
+            HttpRequestOptions(
                 path=path,
                 method="POST",
                 headers=headers,
@@ -314,7 +494,7 @@ def _resolve_sasapay_base_url(*, environment: Environment, base_url: str | None)
         return base_url
 
     if environment == "sandbox":
-        return SASAPAY_SANDBOX_BASE_URL
+        return SASAPAY_BASE_URL
 
     raise ConfigurationError(
         "SasaPay production base_url must be provided explicitly. "
@@ -328,7 +508,7 @@ def _resolve_sasapay_token_provider(
     token_provider: AccessTokenProvider | None,
     client_id: str | None,
     client_secret: str | None,
-    session: requests.Session | Any | None,
+    client: httpx.Client | Any,
     timeout_seconds: float | None,
     token_cache_skew_seconds: float,
     base_url: str,
@@ -345,11 +525,49 @@ def _resolve_sasapay_token_provider(
         token_url=f"{base_url}/auth/token/",
         client_id=client_id,
         client_secret=client_secret,
-        session=session,
+        client=client,
         timeout_seconds=timeout_seconds,
         query={"grant_type": "client_credentials"},
         cache_skew_seconds=token_cache_skew_seconds,
     )
+
+
+def _resolve_async_sasapay_token_provider(
+    *,
+    token_provider: AsyncAccessTokenProvider | None,
+    client_id: str | None,
+    client_secret: str | None,
+    client: httpx.AsyncClient | Any,
+    timeout_seconds: float | None,
+    token_cache_skew_seconds: float,
+    base_url: str,
+) -> AsyncAccessTokenProvider:
+    if token_provider is not None:
+        return token_provider
+
+    if not client_id or not client_secret:
+        raise ConfigurationError(
+            "AsyncSasaPayClient requires either client_id and client_secret, or token_provider."
+        )
+
+    return AsyncClientCredentialsTokenProvider(
+        token_url=f"{base_url}/auth/token/",
+        client_id=client_id,
+        client_secret=client_secret,
+        client=client,
+        timeout_seconds=timeout_seconds,
+        query={"grant_type": "client_credentials"},
+        cache_skew_seconds=token_cache_skew_seconds,
+    )
+
+
+def _resolve_sync_client(
+    client: httpx.Client | Any | None,
+    session: httpx.Client | Any | None,
+) -> httpx.Client | Any | None:
+    if client is not None and session is not None and client is not session:
+        raise ConfigurationError("Provide only one of client or session.")
+    return client if client is not None else session
 
 
 def _with_amount(payload: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:

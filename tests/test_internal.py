@@ -1,26 +1,32 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import asyncio
 from typing import Any
 
+import httpx
 import pytest
-import requests
 
 from noriapay import (
     ApiError,
     AuthenticationError,
     ConfigurationError,
     Hooks,
-    MpesaClient,
     NetworkError,
     RetryDecisionContext,
     RetryPolicy,
-    SasaPayClient,
     TimeoutError,
 )
-from noriapay.http import HttpClient, _normalize_hook_sequence
-from noriapay.oauth import ClientCredentialsTokenProvider
-from noriapay.types import HttpRequestOptions
+from noriapay.http import (
+    AsyncHttpClient,
+    HttpClient,
+    _build_request_kwargs,
+    _calculate_retry_delay,
+    _normalize_hook_sequence,
+    _resolve_retry_policy,
+    _should_retry,
+)
+from noriapay.oauth import AsyncClientCredentialsTokenProvider, ClientCredentialsTokenProvider
+from noriapay.types import AccessToken, HttpRequestOptions
 from noriapay.utils import (
     append_path,
     build_error_message,
@@ -31,44 +37,14 @@ from noriapay.utils import (
     to_amount_string,
     to_object,
 )
-
-
-@dataclass(slots=True)
-class FakeResponse:
-    status_code: int
-    payload: Any = None
-    headers: dict[str, str] = field(default_factory=lambda: {"content-type": "application/json"})
-    text_value: str = ""
-    json_error: Exception | None = None
-
-    @property
-    def ok(self) -> bool:
-        return 200 <= self.status_code < 300
-
-    def json(self) -> Any:
-        if self.json_error is not None:
-            raise self.json_error
-        return self.payload
-
-    @property
-    def text(self) -> str:
-        return self.text_value
-
-
-@dataclass(slots=True)
-class FakeSession:
-    responses: list[Any]
-    calls: list[dict[str, Any]] = field(default_factory=list)
-
-    def request(self, **kwargs: Any) -> FakeResponse:
-        self.calls.append(kwargs)
-        if not self.responses:
-            raise AssertionError("No fake responses left.")
-
-        next_response = self.responses.pop(0)
-        if isinstance(next_response, Exception):
-            raise next_response
-        return next_response
+from tests.support import (
+    FakeAsyncClient,
+    FakeSyncClient,
+    make_json_response,
+    make_network_error,
+    make_text_response,
+    make_timeout_error,
+)
 
 
 def test_utils_cover_non_json_and_helper_paths() -> None:
@@ -81,25 +57,28 @@ def test_utils_cover_non_json_and_helper_paths() -> None:
     assert to_amount_string(1) == "1"
     assert to_amount_string(1.50) == "1.5"
 
-    assert parse_response_body(FakeResponse(200, {"ok": True})) == {"ok": True}
+    assert parse_response_body(make_json_response(200, {"ok": True})) == {"ok": True}
     assert parse_response_body(
-        FakeResponse(
+        make_text_response(
             200,
+            '{"hello":"world"}',
             headers={"content-type": "text/plain"},
-            text_value='{"hello":"world"}',
         )
     ) == {"hello": "world"}
     assert (
         parse_response_body(
-            FakeResponse(
+            make_text_response(
                 200,
+                "raw text",
                 headers={"content-type": "text/plain"},
-                text_value="raw text",
             )
         )
         == "raw text"
     )
-    assert parse_response_body(FakeResponse(200, headers={"content-type": "text/plain"})) is None
+    assert (
+        parse_response_body(make_text_response(200, "", headers={"content-type": "text/plain"}))
+        is None
+    )
 
     assert to_object({"ok": True}) == {"ok": True}
     assert to_object("nope") == {}
@@ -112,9 +91,14 @@ def test_utils_cover_non_json_and_helper_paths() -> None:
     assert merge_headers({"a": "1"}, None, {"b": "2"}) == {"a": "1", "b": "2"}
 
 
-def test_http_client_creates_default_session_and_normalizes_hooks() -> None:
+def test_http_client_creates_default_client_normalizes_hooks_and_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     client = HttpClient(base_url="https://example.com")
-    assert isinstance(client.session, requests.Session)
+    assert isinstance(client.client, httpx.Client)
+
+    closed: list[str] = []
+    monkeypatch.setattr(client.client, "close", lambda: closed.append("closed"))
 
     def hook(context: Any) -> None:
         return None
@@ -122,6 +106,12 @@ def test_http_client_creates_default_session_and_normalizes_hooks() -> None:
     assert _normalize_hook_sequence(None) == []
     assert _normalize_hook_sequence(hook) == [hook]
     assert _normalize_hook_sequence([hook]) == [hook]
+    assert _calculate_retry_delay(None, 1) == 0.0
+
+    with client as entered:
+        assert entered is client
+
+    assert closed == ["closed"]
 
 
 def test_http_client_posts_text_and_runs_hooks() -> None:
@@ -135,18 +125,10 @@ def test_http_client_posts_text_and_runs_hooks() -> None:
     def after_response(context: Any) -> None:
         after_bodies.append(context.response_body)
 
-    session = FakeSession(
-        responses=[
-            FakeResponse(
-                200,
-                headers={"content-type": "text/plain"},
-                text_value="ok",
-            )
-        ]
-    )
+    sync_client = FakeSyncClient(responses=[make_text_response(200, "ok")])
     client = HttpClient(
         base_url="https://example.com",
-        session=session,
+        client=sync_client,
         default_headers={"x-default": "1"},
         hooks=Hooks(
             before_request=before_request,
@@ -159,38 +141,33 @@ def test_http_client_posts_text_and_runs_hooks() -> None:
     assert response == "ok"
     assert before_calls == ["https://example.com/echo"]
     assert after_bodies == ["ok"]
-    assert session.calls[0]["headers"]["x-default"] == "1"
-    assert session.calls[0]["headers"]["x-hooked"] == "yes"
-    assert session.calls[0]["headers"]["content-type"] == "text/plain;charset=UTF-8"
+    assert sync_client.calls[0]["headers"]["x-default"] == "1"
+    assert sync_client.calls[0]["headers"]["x-hooked"] == "yes"
+    assert sync_client.calls[0]["headers"]["content-type"] == "text/plain;charset=UTF-8"
+    assert sync_client.calls[0]["content"] == "hello"
 
 
-def test_http_client_retries_timeout_and_wraps_network_errors(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_http_client_retries_and_wraps_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     sleeps: list[float] = []
     timeout_errors: list[Exception] = []
 
-    def on_error(context: Any) -> None:
-        timeout_errors.append(context.error)
-
     monkeypatch.setattr("noriapay.http.time.sleep", lambda seconds: sleeps.append(seconds))
 
-    retrying_session = FakeSession(
-        responses=[
-            requests.Timeout("slow"),
-            FakeResponse(200, {"status": "ok"}),
-        ]
-    )
     retrying_client = HttpClient(
         base_url="https://example.com",
-        session=retrying_session,
+        client=FakeSyncClient(
+            responses=[
+                make_timeout_error("https://example.com/timeout"),
+                make_json_response(200, {"status": "ok"}),
+            ]
+        ),
         retry=RetryPolicy(
             max_attempts=2,
             retry_methods=("GET",),
             retry_on_network_error=True,
             base_delay_seconds=0.25,
         ),
-        hooks=Hooks(on_error=on_error),
+        hooks=Hooks(on_error=lambda context: timeout_errors.append(context.error)),
     )
 
     assert retrying_client.request(HttpRequestOptions(path="/timeout", method="GET")) == {
@@ -199,26 +176,12 @@ def test_http_client_retries_timeout_and_wraps_network_errors(
     assert isinstance(timeout_errors[0], TimeoutError)
     assert sleeps == [0.25]
 
-    failing_session = FakeSession(responses=[requests.RequestException("boom")])
-    failing_client = HttpClient(base_url="https://example.com", session=failing_session)
-    with pytest.raises(NetworkError):
-        failing_client.request(HttpRequestOptions(path="/network", method="GET"))
-
-
-def test_http_client_covers_remaining_timeout_and_retry_guard_paths() -> None:
-    timeout_client = HttpClient(
-        base_url="https://example.com",
-        session=FakeSession(responses=[requests.Timeout("still slow")]),
-    )
-    with pytest.raises(TimeoutError):
-        timeout_client.request(HttpRequestOptions(path="/timeout-once", method="GET"))
-
     network_retry_client = HttpClient(
         base_url="https://example.com",
-        session=FakeSession(
+        client=FakeSyncClient(
             responses=[
-                requests.RequestException("temporary network issue"),
-                FakeResponse(200, {"status": "recovered"}),
+                make_network_error("https://example.com/network-retry"),
+                make_json_response(200, {"status": "recovered"}),
             ]
         ),
         retry=RetryPolicy(
@@ -231,26 +194,39 @@ def test_http_client_covers_remaining_timeout_and_retry_guard_paths() -> None:
         HttpRequestOptions(path="/network-retry", method="GET")
     ) == {"status": "recovered"}
 
+    failing_client = HttpClient(
+        base_url="https://example.com",
+        client=FakeSyncClient(responses=[make_network_error("https://example.com/network")]),
+    )
+    with pytest.raises(NetworkError):
+        failing_client.request(HttpRequestOptions(path="/network", method="GET"))
+
+    timeout_client = HttpClient(
+        base_url="https://example.com",
+        client=FakeSyncClient(responses=[make_timeout_error("https://example.com/timeout-once")]),
+    )
+    with pytest.raises(TimeoutError):
+        timeout_client.request(HttpRequestOptions(path="/timeout-once", method="GET"))
+
     impossible_client = HttpClient(
         base_url="https://example.com",
-        session=FakeSession(responses=[]),
+        client=FakeSyncClient(responses=[]),
         retry=RetryPolicy(max_attempts=0),
     )
     with pytest.raises(RuntimeError, match="unreachable retry state"):
         impossible_client.request(HttpRequestOptions(path="/impossible", method="GET"))
 
 
-def test_http_client_wraps_api_errors_and_covers_retry_helpers() -> None:
+def test_http_client_wraps_api_errors_and_helper_functions() -> None:
     on_error_payloads: list[object] = []
-    session = FakeSession(
-        responses=[
-            FakeResponse(500, {"message": "try again"}),
-            FakeResponse(200, {"status": True}),
-        ]
-    )
     client = HttpClient(
         base_url="https://example.com",
-        session=session,
+        client=FakeSyncClient(
+            responses=[
+                make_json_response(500, {"message": "try again"}),
+                make_json_response(200, {"status": True}),
+            ]
+        ),
         retry=RetryPolicy(
             max_attempts=2,
             retry_methods=("GET",),
@@ -263,8 +239,10 @@ def test_http_client_wraps_api_errors_and_covers_retry_helpers() -> None:
     assert client.request(HttpRequestOptions(path="/status", method="GET")) == {"status": True}
     assert on_error_payloads == [{"message": "try again"}]
 
-    api_session = FakeSession(responses=[FakeResponse(400, {"message": "bad request"})])
-    api_client = HttpClient(base_url="https://example.com", session=api_session)
+    api_client = HttpClient(
+        base_url="https://example.com",
+        client=FakeSyncClient(responses=[make_json_response(400, {"message": "bad request"})]),
+    )
     with pytest.raises(ApiError) as error:
         api_client.request(HttpRequestOptions(path="/bad", method="GET"))
     assert error.value.status_code == 400
@@ -275,26 +253,16 @@ def test_http_client_wraps_api_errors_and_covers_retry_helpers() -> None:
         retry_on_statuses=(500,),
         retry_on_network_error=True,
     )
-    helper_client = HttpClient(
-        base_url="https://example.com",
-        session=FakeSession(responses=[]),
-        retry=base_retry,
-    )
-    assert helper_client._resolve_retry_policy(False) is None
-    assert helper_client._resolve_retry_policy(None) == base_retry
     override = RetryPolicy(max_attempts=3)
-    merged = helper_client._resolve_retry_policy(override)
+    merged = _resolve_retry_policy(base_retry, override)
     assert merged is not None
     assert merged.max_attempts == 3
     assert merged.retry_methods == ("GET",)
     assert merged.retry_on_statuses == (500,)
-
-    no_default_client = HttpClient(
-        base_url="https://example.com",
-        session=FakeSession(responses=[]),
-    )
-    assert no_default_client._resolve_retry_policy(override) == override
-    assert not helper_client._should_retry(
+    assert _resolve_retry_policy(base_retry, False) is None
+    assert _resolve_retry_policy(base_retry, None) == base_retry
+    assert _resolve_retry_policy(None, override) == override
+    assert not _should_retry(
         base_retry,
         RetryDecisionContext(
             attempt=1,
@@ -304,7 +272,7 @@ def test_http_client_wraps_api_errors_and_covers_retry_helpers() -> None:
             status=500,
         ),
     )
-    assert not helper_client._should_retry(
+    assert not _should_retry(
         base_retry,
         RetryDecisionContext(
             attempt=1,
@@ -314,7 +282,7 @@ def test_http_client_wraps_api_errors_and_covers_retry_helpers() -> None:
             status=404,
         ),
     )
-    assert not helper_client._should_retry(
+    assert not _should_retry(
         RetryPolicy(max_attempts=2, retry_methods=("GET",)),
         RetryDecisionContext(
             attempt=1,
@@ -324,43 +292,228 @@ def test_http_client_wraps_api_errors_and_covers_retry_helpers() -> None:
             error=NetworkError("network"),
         ),
     )
-    helper_client._sleep_before_retry(None, 1)
+    request_kwargs = _build_request_kwargs(
+        method="POST",
+        url="https://example.com/path",
+        headers={"x-test": "1"},
+        query={"country": "kenya", "skip": None},
+        body={"amount": 1},
+        timeout_seconds=5.0,
+    )
+    assert request_kwargs["params"] == {"country": "kenya"}
+    assert request_kwargs["json"] == {"amount": 1}
+    assert request_kwargs["headers"]["content-type"] == "application/json"
+    assert _calculate_retry_delay(RetryPolicy(base_delay_seconds=0.5), 2) == 1.0
 
 
-def test_token_provider_caches_clears_and_wraps_failures() -> None:
-    provider_without_session = ClientCredentialsTokenProvider(
+def test_async_http_client_covers_success_retry_errors_and_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        client = AsyncHttpClient(base_url="https://example.com")
+        assert isinstance(client.client, httpx.AsyncClient)
+
+        closed: list[str] = []
+
+        async def fake_close() -> None:
+            closed.append("closed")
+
+        monkeypatch.setattr(client.client, "aclose", fake_close)
+        async with client as entered:
+            assert entered is client
+        assert closed == ["closed"]
+
+        before_calls: list[str] = []
+        after_bodies: list[object] = []
+
+        def before_request(context: Any) -> None:
+            before_calls.append(context.url)
+            context.headers["x-hooked"] = "yes"
+
+        def after_response(context: Any) -> None:
+            after_bodies.append(context.response_body)
+
+        async_client = AsyncHttpClient(
+            base_url="https://example.com",
+            client=FakeAsyncClient(responses=[make_text_response(200, "ok")]),
+            default_headers={"x-default": "1"},
+            hooks=Hooks(before_request=before_request, after_response=after_response),
+        )
+        response = await async_client.request(
+            HttpRequestOptions(path="/echo", method="POST", body="hello")
+        )
+        assert response == "ok"
+        fake_client = async_client.client
+        assert before_calls == ["https://example.com/echo"]
+        assert after_bodies == ["ok"]
+        assert fake_client.calls[0]["headers"]["content-type"] == "text/plain;charset=UTF-8"
+        assert fake_client.calls[0]["content"] == "hello"
+
+        sleeps: list[float] = []
+        timeout_errors: list[Exception] = []
+
+        async def fake_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        monkeypatch.setattr("noriapay.http.asyncio.sleep", fake_sleep)
+
+        retrying_client = AsyncHttpClient(
+            base_url="https://example.com",
+            client=FakeAsyncClient(
+                responses=[
+                    make_timeout_error("https://example.com/timeout"),
+                    make_json_response(200, {"status": "ok"}),
+                ]
+            ),
+            retry=RetryPolicy(
+                max_attempts=2,
+                retry_methods=("GET",),
+                retry_on_network_error=True,
+                base_delay_seconds=0.25,
+            ),
+            hooks=Hooks(on_error=lambda context: timeout_errors.append(context.error)),
+        )
+        assert await retrying_client.request(HttpRequestOptions(path="/timeout", method="GET")) == {
+            "status": "ok"
+        }
+        assert isinstance(timeout_errors[0], TimeoutError)
+        assert sleeps == [0.25]
+
+        network_retry_client = AsyncHttpClient(
+            base_url="https://example.com",
+            client=FakeAsyncClient(
+                responses=[
+                    make_network_error("https://example.com/network-retry"),
+                    make_json_response(200, {"status": "recovered"}),
+                ]
+            ),
+            retry=RetryPolicy(
+                max_attempts=2,
+                retry_methods=("GET",),
+                retry_on_network_error=True,
+            ),
+        )
+        assert await network_retry_client.request(
+            HttpRequestOptions(path="/network-retry", method="GET")
+        ) == {"status": "recovered"}
+
+        failing_client = AsyncHttpClient(
+            base_url="https://example.com",
+            client=FakeAsyncClient(responses=[make_network_error("https://example.com/network")]),
+        )
+        with pytest.raises(NetworkError):
+            await failing_client.request(HttpRequestOptions(path="/network", method="GET"))
+
+        timeout_client = AsyncHttpClient(
+            base_url="https://example.com",
+            client=FakeAsyncClient(
+                responses=[make_timeout_error("https://example.com/timeout-once")]
+            ),
+        )
+        with pytest.raises(TimeoutError):
+            await timeout_client.request(HttpRequestOptions(path="/timeout-once", method="GET"))
+
+        api_client = AsyncHttpClient(
+            base_url="https://example.com",
+            client=FakeAsyncClient(responses=[make_json_response(400, {"message": "bad request"})]),
+        )
+        with pytest.raises(ApiError):
+            await api_client.request(HttpRequestOptions(path="/bad", method="GET"))
+
+        retrying_api_client = AsyncHttpClient(
+            base_url="https://example.com",
+            client=FakeAsyncClient(
+                responses=[
+                    make_json_response(500, {"message": "try again"}),
+                    make_json_response(200, {"status": True}),
+                ]
+            ),
+            retry=RetryPolicy(
+                max_attempts=2,
+                retry_methods=("GET",),
+                retry_on_statuses=(500,),
+                base_delay_seconds=0.25,
+            ),
+        )
+        assert await retrying_api_client.request(
+            HttpRequestOptions(path="/status-retry", method="GET")
+        ) == {"status": True}
+
+        impossible_client = AsyncHttpClient(
+            base_url="https://example.com",
+            client=FakeAsyncClient(responses=[]),
+            retry=RetryPolicy(max_attempts=0),
+        )
+        with pytest.raises(RuntimeError, match="unreachable retry state"):
+            await impossible_client.request(HttpRequestOptions(path="/impossible", method="GET"))
+
+    asyncio.run(run())
+
+
+def test_token_provider_caches_wraps_failures_and_supports_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider_without_client = ClientCredentialsTokenProvider(
         token_url="https://example.com/token",
         client_id="client-id",
         client_secret="client-secret",
     )
-    assert isinstance(provider_without_session.session, requests.Session)
+    assert isinstance(provider_without_client.client, httpx.Client)
 
-    session = FakeSession(
+    closed: list[str] = []
+    monkeypatch.setattr(provider_without_client.client, "close", lambda: closed.append("closed"))
+    with provider_without_client as provider:
+        assert provider is provider_without_client
+    assert closed == ["closed"]
+
+    sync_client = FakeSyncClient(
         responses=[
-            FakeResponse(200, {"access_token": "token-1", "expires_in": 3600}),
-            FakeResponse(200, {"access_token": "token-2", "expires_in": 3600}),
+            make_json_response(200, {"access_token": "token-1", "expires_in": 3600}),
+            make_json_response(200, {"access_token": "token-2", "expires_in": 3600}),
         ]
     )
     provider = ClientCredentialsTokenProvider(
         token_url="https://example.com/token",
         client_id="client-id",
         client_secret="client-secret",
-        session=session,
+        client=sync_client,
     )
 
     assert provider.get_access_token() == "token-1"
     assert provider.get_token().access_token == "token-1"
-    assert len(session.calls) == 1
+    assert len(sync_client.calls) == 1
 
     provider.clear_cache()
     assert provider.get_access_token() == "token-2"
-    assert len(session.calls) == 2
+    assert len(sync_client.calls) == 2
+
+    mapped_provider = ClientCredentialsTokenProvider(
+        token_url="https://example.com/token",
+        client_id="client-id",
+        client_secret="client-secret",
+        client=FakeSyncClient(responses=[make_json_response(200, {"token": "mapped"})]),
+        map_response=lambda payload: AccessToken(
+            access_token=str(payload["token"]),
+            expires_in=3600,
+            raw=payload,
+        ),
+    )
+    assert mapped_provider.get_access_token() == "mapped"
+
+    with pytest.raises(ConfigurationError):
+        ClientCredentialsTokenProvider(
+            token_url="https://example.com/token",
+            client_id="client-id",
+            client_secret="client-secret",
+            client=FakeSyncClient(responses=[]),
+            session=FakeSyncClient(responses=[]),
+        )
 
     timeout_provider = ClientCredentialsTokenProvider(
         token_url="https://example.com/token",
         client_id="client-id",
         client_secret="client-secret",
-        session=FakeSession(responses=[requests.Timeout("slow")]),
+        client=FakeSyncClient(responses=[make_timeout_error("https://example.com/token")]),
     )
     with pytest.raises(AuthenticationError):
         timeout_provider.get_token()
@@ -369,7 +522,7 @@ def test_token_provider_caches_clears_and_wraps_failures() -> None:
         token_url="https://example.com/token",
         client_id="client-id",
         client_secret="client-secret",
-        session=FakeSession(responses=[requests.RequestException("boom")]),
+        client=FakeSyncClient(responses=[make_network_error("https://example.com/token")]),
     )
     with pytest.raises(AuthenticationError):
         network_provider.get_token()
@@ -378,12 +531,12 @@ def test_token_provider_caches_clears_and_wraps_failures() -> None:
         token_url="https://example.com/token",
         client_id="client-id",
         client_secret="client-secret",
-        session=FakeSession(
+        client=FakeSyncClient(
             responses=[
-                FakeResponse(
+                httpx.Response(
                     401,
+                    text="{invalid",
                     headers={"content-type": "application/json"},
-                    json_error=ValueError("invalid json"),
                 )
             ]
         ),
@@ -392,185 +545,81 @@ def test_token_provider_caches_clears_and_wraps_failures() -> None:
         bad_response_provider.get_token()
 
 
-def test_mpesa_client_covers_remaining_methods_and_configuration_error() -> None:
-    with pytest.raises(ConfigurationError):
-        MpesaClient()
+def test_async_token_provider_caches_wraps_failures_and_supports_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        provider_without_client = AsyncClientCredentialsTokenProvider(
+            token_url="https://example.com/token",
+            client_id="client-id",
+            client_secret="client-secret",
+        )
+        assert isinstance(provider_without_client.client, httpx.AsyncClient)
 
-    session = FakeSession(
-        responses=[
-            FakeResponse(200, {"access_token": "mpesa-token", "expires_in": 3600}),
-            FakeResponse(200, {"ResponseCode": "0", "Result": "stk query"}),
-            FakeResponse(200, {"ResponseCode": "0", "Result": "register"}),
-            FakeResponse(200, {"ResponseCode": "0", "Result": "b2c"}),
-            FakeResponse(200, {"ResponseCode": "0", "Result": "b2b"}),
-            FakeResponse(200, {"ResponseCode": "0", "Result": "reversal"}),
-            FakeResponse(200, {"ResponseCode": "0", "Result": "status"}),
-            FakeResponse(200, {"ResponseCode": "0", "Result": "qr"}),
-        ]
-    )
-    client = MpesaClient(
-        consumer_key="consumer-key",
-        consumer_secret="consumer-secret",
-        session=session,
-    )
+        closed: list[str] = []
 
-    assert client.get_access_token() == "mpesa-token"
-    assert (
-        client.stk_push_query(
-            {
-                "BusinessShortCode": "174379",
-                "Password": "password",
-                "Timestamp": "20250102030405",
-                "CheckoutRequestID": "ws_CO_123",
-            }
-        )["Result"]
-        == "stk query"
-    )
-    assert (
-        client.register_c2b_urls(
-            {
-                "ShortCode": "600000",
-                "ResponseType": "Completed",
-                "ConfirmationURL": "https://example.com/confirm",
-                "ValidationURL": "https://example.com/validate",
-            },
-            version="v1",
-        )["Result"]
-        == "register"
-    )
-    assert (
-        client.b2c_payment(
-            {
-                "InitiatorName": "apiuser",
-                "SecurityCredential": "EncryptedPassword",
-                "CommandID": "BusinessPayment",
-                "Amount": 10,
-                "PartyA": "600000",
-                "PartyB": "254700000000",
-                "Remarks": "B2C",
-                "QueueTimeOutURL": "https://example.com/timeout",
-                "ResultURL": "https://example.com/result",
-            }
-        )["Result"]
-        == "b2c"
-    )
-    assert (
-        client.b2b_payment(
-            {
-                "Initiator": "apiuser",
-                "SecurityCredential": "EncryptedPassword",
-                "CommandID": "BusinessPayBill",
-                "Amount": 20,
-                "PartyA": "600000",
-                "PartyB": "600001",
-                "Remarks": "B2B",
-                "AccountReference": "ACC-1",
-                "QueueTimeOutURL": "https://example.com/timeout",
-                "ResultURL": "https://example.com/result",
-            }
-        )["Result"]
-        == "b2b"
-    )
-    assert (
-        client.reversal(
-            {
-                "Initiator": "apiuser",
-                "SecurityCredential": "EncryptedPassword",
-                "CommandID": "TransactionReversal",
-                "TransactionID": "LKXXXX1234",
-                "Amount": 30,
-                "ReceiverParty": "600000",
-                "RecieverIdentifierType": "11",
-                "ResultURL": "https://example.com/result",
-                "QueueTimeOutURL": "https://example.com/timeout",
-                "Remarks": "Reverse",
-            }
-        )["Result"]
-        == "reversal"
-    )
-    assert (
-        client.transaction_status(
-            {
-                "Initiator": "apiuser",
-                "SecurityCredential": "EncryptedPassword",
-                "CommandID": "TransactionStatusQuery",
-                "TransactionID": "LKXXXX1234",
-                "PartyA": "600000",
-                "IdentifierType": "4",
-                "ResultURL": "https://example.com/result",
-                "QueueTimeOutURL": "https://example.com/timeout",
-                "Remarks": "Status",
-            }
-        )["Result"]
-        == "status"
-    )
-    assert (
-        client.generate_qr_code(
-            {
-                "MerchantName": "Noria",
-                "MerchantShortCode": "174379",
-                "Amount": 40,
-                "QRType": "Dynamic",
-            }
-        )["Result"]
-        == "qr"
-    )
-    assert session.calls[1]["json"]["CheckoutRequestID"] == "ws_CO_123"
-    assert session.calls[3]["json"]["Amount"] == "10"
-    assert session.calls[7]["json"]["Amount"] == "40"
+        async def fake_close() -> None:
+            closed.append("closed")
 
+        monkeypatch.setattr(provider_without_client.client, "aclose", fake_close)
+        async with provider_without_client as provider:
+            assert provider is provider_without_client
+        assert closed == ["closed"]
 
-def test_sasapay_client_covers_remaining_methods_and_configuration_error() -> None:
-    with pytest.raises(ConfigurationError):
-        SasaPayClient(environment="sandbox")
+        async_client = FakeAsyncClient(
+            responses=[
+                make_json_response(200, {"access_token": "token-1", "expires_in": 3600}),
+                make_json_response(200, {"access_token": "token-2", "expires_in": 3600}),
+            ]
+        )
+        provider = AsyncClientCredentialsTokenProvider(
+            token_url="https://example.com/token",
+            client_id="client-id",
+            client_secret="client-secret",
+            client=async_client,
+        )
 
-    session = FakeSession(
-        responses=[
-            FakeResponse(200, {"access_token": "sasapay-token", "expires_in": 3600}),
-            FakeResponse(200, {"status": True, "detail": "b2c"}),
-            FakeResponse(200, {"status": True, "detail": "b2b"}),
-        ]
-    )
-    client = SasaPayClient(
-        client_id="client-id",
-        client_secret="client-secret",
-        environment="production",
-        base_url="https://api.example.com/sasapay",
-        session=session,
-    )
+        assert await provider.get_access_token() == "token-1"
+        assert (await provider.get_token()).access_token == "token-1"
+        assert len(async_client.calls) == 1
 
-    assert client.get_access_token() == "sasapay-token"
-    assert (
-        client.b2c_payment(
-            {
-                "MerchantCode": "600980",
-                "Amount": 10,
-                "Currency": "KES",
-                "MerchantTransactionReference": "ref-1",
-                "ReceiverNumber": "254700000080",
-                "Channel": "63902",
-                "Reason": "Payout",
-                "CallBackURL": "https://example.com/callback",
-            }
-        )["detail"]
-        == "b2c"
-    )
-    assert (
-        client.b2b_payment(
-            {
-                "MerchantCode": "600980",
-                "MerchantTransactionReference": "ref-2",
-                "Currency": "KES",
-                "Amount": 12,
-                "ReceiverMerchantCode": "600981",
-                "AccountReference": "ACC-2",
-                "ReceiverAccountType": "merchant",
-                "NetworkCode": "63902",
-                "Reason": "Settlement",
-                "CallBackURL": "https://example.com/callback",
-            }
-        )["detail"]
-        == "b2b"
-    )
-    assert session.calls[1]["json"]["Amount"] == "10"
-    assert session.calls[2]["json"]["Amount"] == "12"
+        provider.clear_cache()
+        assert await provider.get_access_token() == "token-2"
+        assert len(async_client.calls) == 2
+
+        timeout_provider = AsyncClientCredentialsTokenProvider(
+            token_url="https://example.com/token",
+            client_id="client-id",
+            client_secret="client-secret",
+            client=FakeAsyncClient(responses=[make_timeout_error("https://example.com/token")]),
+        )
+        with pytest.raises(AuthenticationError):
+            await timeout_provider.get_token()
+
+        network_provider = AsyncClientCredentialsTokenProvider(
+            token_url="https://example.com/token",
+            client_id="client-id",
+            client_secret="client-secret",
+            client=FakeAsyncClient(responses=[make_network_error("https://example.com/token")]),
+        )
+        with pytest.raises(AuthenticationError):
+            await network_provider.get_token()
+
+        bad_response_provider = AsyncClientCredentialsTokenProvider(
+            token_url="https://example.com/token",
+            client_id="client-id",
+            client_secret="client-secret",
+            client=FakeAsyncClient(
+                responses=[
+                    httpx.Response(
+                        401,
+                        text="{invalid",
+                        headers={"content-type": "application/json"},
+                    )
+                ]
+            ),
+        )
+        with pytest.raises(AuthenticationError):
+            await bad_response_provider.get_token()
+
+    asyncio.run(run())

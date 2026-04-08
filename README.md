@@ -1,14 +1,6 @@
 # `noriapay`
 
-Reference-first Python SDK for African payment providers.
-
-Current provider support:
-
-- M-PESA Daraja
-- SasaPay
-- Paystack
-
-This README is intended to be the public API reference for the package exported from `noriapay`.
+Example-first Python SDK for M-PESA Daraja, SasaPay, and Paystack, built on `httpx` with sync and async clients.
 
 ## Install
 
@@ -16,50 +8,1250 @@ This README is intended to be the public API reference for the package exported 
 pip install noriapay
 ```
 
-Python requirement: `>=3.11`
+## What It Covers
 
-## Scope
+- M-PESA Daraja: STK push, STK query, C2B URL registration, B2C, B2B, reversal, transaction status, account balance, QR generation
+- SasaPay: request payment, OTP completion, B2C, B2B
+- Paystack: transaction initialize and verify, bank listing, account resolution, transfer recipient creation, transfer initiation, transfer finalization, transfer verification
+- Sync and async clients for every supported provider
+- Custom `httpx` clients, retry policy, hooks, env-based configuration, webhook verification helpers
 
-Implemented now:
+## Quick Setup
 
-- M-PESA OAuth client credentials
-- M-PESA STK push
-- M-PESA STK push query
-- M-PESA C2B URL registration (`v1` and `v2`)
-- M-PESA B2C
-- M-PESA B2B
-- M-PESA reversal
-- M-PESA transaction status query
-- M-PESA account balance query
-- M-PESA QR generation
-- SasaPay OAuth client credentials
-- SasaPay C2B request payment
-- SasaPay C2B OTP completion
-- SasaPay B2C
-- SasaPay B2B
-- SasaPay callback and IPN payload type definitions
-- Paystack transaction initialize
-- Paystack transaction verify
-- Paystack bank listing
-- Paystack account resolution
-- Paystack transfer recipient creation
-- Paystack transfer initiation
-- Paystack transfer finalization
-- Paystack transfer verification
-- Paystack webhook signature verification helpers
+### Environment Variables
 
-Not implemented yet:
+```bash
+# M-PESA
+export MPESA_CONSUMER_KEY=your_consumer_key
+export MPESA_CONSUMER_SECRET=your_consumer_secret
+export MPESA_ENVIRONMENT=sandbox
+# optional
+export MPESA_BASE_URL=
+export MPESA_TIMEOUT_SECONDS=30
+export MPESA_TOKEN_CACHE_SKEW_SECONDS=60
 
-- SasaPay checkout payments
-- SasaPay remittance
-- SasaPay utilities
-- SasaPay WaaS
-- Daraja Bill Manager and portal-only APIs with undocumented request bodies
-- Most other Paystack APIs outside the initial payment and transfer flows above
+# SasaPay
+export SASAPAY_CLIENT_ID=your_client_id
+export SASAPAY_CLIENT_SECRET=your_client_secret
+export SASAPAY_ENVIRONMENT=sandbox
+export SASAPAY_BASE_URL=https://sandbox.sasapay.app/api/v1
+# optional
+export SASAPAY_TIMEOUT_SECONDS=30
+export SASAPAY_TOKEN_CACHE_SKEW_SECONDS=60
+
+# Paystack
+export PAYSTACK_SECRET_KEY=sk_test_xxx
+# optional
+export PAYSTACK_BASE_URL=https://api.paystack.co
+export PAYSTACK_TIMEOUT_SECONDS=30
+```
+
+SasaPay note:
+
+- `SASAPAY_BASE_URL` defaults to the sandbox host
+- for live SasaPay, set `SASAPAY_ENVIRONMENT=production` and provide the live `SASAPAY_BASE_URL` issued for your account or environment
+
+### Build Clients From Env
+
+```python
+from noriapay import (
+    AsyncMpesaClient,
+    AsyncPaystackClient,
+    AsyncSasaPayClient,
+    MpesaClient,
+    PaystackClient,
+    SasaPayClient,
+)
+
+mpesa = MpesaClient.from_env()
+sasapay = SasaPayClient.from_env()
+paystack = PaystackClient.from_env()
+
+
+async def build_async_clients() -> tuple[
+    AsyncMpesaClient,
+    AsyncSasaPayClient,
+    AsyncPaystackClient,
+]:
+    return (
+        AsyncMpesaClient.from_env(),
+        AsyncSasaPayClient.from_env(),
+        AsyncPaystackClient.from_env(),
+    )
+```
+
+### Direct Construction
+
+```python
+from noriapay import MpesaClient, PaystackClient, SasaPayClient
+
+mpesa = MpesaClient(
+    consumer_key="consumer-key",
+    consumer_secret="consumer-secret",
+    environment="sandbox",
+)
+
+sasapay = SasaPayClient(
+    client_id="client-id",
+    client_secret="client-secret",
+    environment="sandbox",
+)
+
+paystack = PaystackClient(secret_key="sk_test_xxx")
+```
+
+## M-PESA Recipes
+
+### Create A Client
+
+```python
+from noriapay import MpesaClient
+
+mpesa = MpesaClient.from_env()
+
+# or direct construction
+mpesa = MpesaClient(
+    consumer_key="consumer-key",
+    consumer_secret="consumer-secret",
+    environment="sandbox",
+)
+```
+
+### STK Push
+
+```python
+from noriapay import MpesaClient, build_mpesa_stk_password, build_mpesa_timestamp
+
+mpesa = MpesaClient.from_env()
+
+timestamp = build_mpesa_timestamp()
+response = mpesa.stk_push(
+    {
+        "BusinessShortCode": "174379",
+        "Password": build_mpesa_stk_password(
+            business_short_code="174379",
+            passkey="your-passkey",
+            timestamp=timestamp,
+        ),
+        "Timestamp": timestamp,
+        "TransactionType": "CustomerPayBillOnline",
+        "Amount": 1,
+        "PartyA": "254700000000",
+        "PartyB": "174379",
+        "PhoneNumber": "254700000000",
+        "CallBackURL": "https://example.com/mpesa/callback",
+        "AccountReference": "INV-001",
+        "TransactionDesc": "Payment for invoice INV-001",
+    }
+)
+
+checkout_request_id = response["CheckoutRequestID"]
+```
+
+### Query An STK Push
+
+```python
+from noriapay import build_mpesa_stk_password, build_mpesa_timestamp
+
+timestamp = build_mpesa_timestamp()
+status = mpesa.stk_push_query(
+    {
+        "BusinessShortCode": "174379",
+        "Password": build_mpesa_stk_password(
+            business_short_code="174379",
+            passkey="your-passkey",
+            timestamp=timestamp,
+        ),
+        "Timestamp": timestamp,
+        "CheckoutRequestID": "ws_CO_123456789",
+    }
+)
+```
+
+### Register C2B URLs
+
+```python
+response = mpesa.register_c2b_urls(
+    {
+        "ShortCode": "600000",
+        "ResponseType": "Completed",
+        "ConfirmationURL": "https://example.com/mpesa/confirmation",
+        "ValidationURL": "https://example.com/mpesa/validation",
+    },
+    version="v2",
+)
+```
+
+### Send A B2C Payment
+
+```python
+response = mpesa.b2c_payment(
+    {
+        "InitiatorName": "apiuser",
+        "SecurityCredential": "EncryptedPassword",
+        "CommandID": "BusinessPayment",
+        "Amount": 10,
+        "PartyA": "600000",
+        "PartyB": "254700000000",
+        "Remarks": "Customer payout",
+        "QueueTimeOutURL": "https://example.com/mpesa/timeout",
+        "ResultURL": "https://example.com/mpesa/result",
+    }
+)
+```
+
+### Send A B2B Payment
+
+```python
+response = mpesa.b2b_payment(
+    {
+        "Initiator": "apiuser",
+        "SecurityCredential": "EncryptedPassword",
+        "CommandID": "BusinessPayBill",
+        "Amount": 20,
+        "PartyA": "600000",
+        "PartyB": "600001",
+        "Remarks": "Merchant settlement",
+        "AccountReference": "SETTLEMENT-001",
+        "QueueTimeOutURL": "https://example.com/mpesa/timeout",
+        "ResultURL": "https://example.com/mpesa/result",
+    }
+)
+```
+
+### Reverse A Transaction
+
+```python
+response = mpesa.reversal(
+    {
+        "Initiator": "apiuser",
+        "SecurityCredential": "EncryptedPassword",
+        "CommandID": "TransactionReversal",
+        "TransactionID": "LKXXXX1234",
+        "Amount": 30,
+        "ReceiverParty": "600000",
+        "RecieverIdentifierType": "11",
+        "ResultURL": "https://example.com/mpesa/result",
+        "QueueTimeOutURL": "https://example.com/mpesa/timeout",
+        "Remarks": "Reverse duplicate charge",
+    }
+)
+```
+
+### Check Transaction Status
+
+```python
+response = mpesa.transaction_status(
+    {
+        "Initiator": "apiuser",
+        "SecurityCredential": "EncryptedPassword",
+        "CommandID": "TransactionStatusQuery",
+        "TransactionID": "LKXXXX1234",
+        "PartyA": "600000",
+        "IdentifierType": "4",
+        "ResultURL": "https://example.com/mpesa/result",
+        "QueueTimeOutURL": "https://example.com/mpesa/timeout",
+        "Remarks": "Status check",
+    }
+)
+```
+
+### Check Account Balance
+
+```python
+response = mpesa.account_balance(
+    {
+        "Initiator": "apiuser",
+        "SecurityCredential": "EncryptedPassword",
+        "CommandID": "AccountBalance",
+        "PartyA": "600000",
+        "IdentifierType": "4",
+        "ResultURL": "https://example.com/mpesa/result",
+        "QueueTimeOutURL": "https://example.com/mpesa/timeout",
+        "Remarks": "Balance check",
+    }
+)
+```
+
+### Generate A QR Code
+
+```python
+response = mpesa.generate_qr_code(
+    {
+        "MerchantName": "Noria",
+        "MerchantShortCode": "174379",
+        "Amount": 40,
+        "QRType": "Dynamic",
+    }
+)
+```
+
+### Async M-PESA
+
+```python
+from noriapay import AsyncMpesaClient, build_mpesa_stk_password, build_mpesa_timestamp
+
+
+async def push() -> None:
+    async with AsyncMpesaClient.from_env() as mpesa:
+        timestamp = build_mpesa_timestamp()
+        response = await mpesa.stk_push(
+            {
+                "BusinessShortCode": "174379",
+                "Password": build_mpesa_stk_password(
+                    business_short_code="174379",
+                    passkey="your-passkey",
+                    timestamp=timestamp,
+                ),
+                "Timestamp": timestamp,
+                "TransactionType": "CustomerPayBillOnline",
+                "Amount": 1,
+                "PartyA": "254700000000",
+                "PartyB": "174379",
+                "PhoneNumber": "254700000000",
+                "CallBackURL": "https://example.com/mpesa/callback",
+                "AccountReference": "INV-001",
+                "TransactionDesc": "Payment",
+            }
+        )
+        print(response["CheckoutRequestID"])
+```
+
+### M-PESA Notes
+
+- `MPESA_BASE_URLS["sandbox"]` is `https://sandbox.safaricom.co.ke`
+- `MPESA_BASE_URLS["production"]` is `https://api.safaricom.co.ke`
+- `build_mpesa_timestamp()` returns `YYYYMMDDHHMMSS`
+- `build_mpesa_stk_password()` base64-encodes `shortcode + passkey + timestamp`
+- amount fields accept `str`, `int`, or `float`; the SDK serializes them to provider-compatible strings
+- you can provide `token_provider=` instead of `consumer_key` and `consumer_secret`
+
+### M-PESA API Map
+
+```python
+MpesaClient(
+    *,
+    consumer_key=None,
+    consumer_secret=None,
+    token_provider=None,
+    environment="sandbox",
+    base_url=None,
+    client=None,
+    session=None,
+    timeout_seconds=None,
+    token_cache_skew_seconds=60.0,
+    default_headers=None,
+    retry=None,
+    hooks=None,
+)
+
+MpesaClient.from_env(
+    *,
+    prefix="MPESA_",
+    environ=None,
+    token_provider=None,
+    client=None,
+    session=None,
+    default_headers=None,
+    retry=None,
+    hooks=None,
+)
+
+mpesa.get_access_token(force_refresh=False)
+mpesa.stk_push(payload, options=None)
+mpesa.stk_push_query(payload, options=None)
+mpesa.register_c2b_urls(payload, version="v2", options=None)
+mpesa.b2c_payment(payload, options=None)
+mpesa.b2b_payment(payload, options=None)
+mpesa.reversal(payload, options=None)
+mpesa.transaction_status(payload, options=None)
+mpesa.account_balance(payload, options=None)
+mpesa.generate_qr_code(payload, options=None)
+mpesa.close()
+```
+
+```python
+AsyncMpesaClient(
+    *,
+    consumer_key=None,
+    consumer_secret=None,
+    token_provider=None,
+    environment="sandbox",
+    base_url=None,
+    client=None,
+    timeout_seconds=None,
+    token_cache_skew_seconds=60.0,
+    default_headers=None,
+    retry=None,
+    hooks=None,
+)
+
+AsyncMpesaClient.from_env(
+    *,
+    prefix="MPESA_",
+    environ=None,
+    token_provider=None,
+    client=None,
+    default_headers=None,
+    retry=None,
+    hooks=None,
+)
+
+await mpesa.get_access_token(force_refresh=False)
+await mpesa.stk_push(payload, options=None)
+await mpesa.stk_push_query(payload, options=None)
+await mpesa.register_c2b_urls(payload, version="v2", options=None)
+await mpesa.b2c_payment(payload, options=None)
+await mpesa.b2b_payment(payload, options=None)
+await mpesa.reversal(payload, options=None)
+await mpesa.transaction_status(payload, options=None)
+await mpesa.account_balance(payload, options=None)
+await mpesa.generate_qr_code(payload, options=None)
+await mpesa.aclose()
+```
+
+### M-PESA Exported Models
+
+- `MpesaApiResponse`
+- `MpesaStkPushRequest`
+- `MpesaStkPushResponse`
+- `MpesaStkQueryRequest`
+- `MpesaRegisterC2BUrlsRequest`
+- `MpesaB2CRequest`
+- `MpesaB2BRequest`
+- `MpesaReversalRequest`
+- `MpesaTransactionStatusRequest`
+- `MpesaAccountBalanceRequest`
+- `MpesaQrCodeRequest`
+
+## SasaPay Recipes
+
+### Create A Client
+
+```python
+from noriapay import SasaPayClient
+
+sasapay = SasaPayClient.from_env()
+
+# or direct construction
+sasapay = SasaPayClient(
+    client_id="client-id",
+    client_secret="client-secret",
+    environment="sandbox",
+)
+```
+
+For production SasaPay:
+
+```python
+sasapay = SasaPayClient(
+    client_id="client-id",
+    client_secret="client-secret",
+    environment="production",
+    base_url="https://your-live-sasapay-host/api/v1",
+)
+```
+
+### Request A Mobile Money Payment
+
+```python
+response = sasapay.request_payment(
+    {
+        "MerchantCode": "600980",
+        "NetworkCode": "63902",
+        "Currency": "KES",
+        "Amount": 1,
+        "PhoneNumber": "254700000080",
+        "AccountReference": "INV-001",
+        "TransactionDesc": "Invoice payment",
+        "CallBackURL": "https://example.com/sasapay/callback",
+    }
+)
+
+checkout_request_id = response["CheckoutRequestID"]
+```
+
+### Request A Wallet Payment And Complete OTP
+
+`NetworkCode="0"` is the documented SasaPay wallet flow and typically requires `process_payment()`.
+
+```python
+request = sasapay.request_payment(
+    {
+        "MerchantCode": "600980",
+        "NetworkCode": "0",
+        "Currency": "KES",
+        "Amount": "1.00",
+        "PhoneNumber": "254700000080",
+        "AccountReference": "WALLET-001",
+        "TransactionDesc": "Wallet debit",
+        "CallBackURL": "https://example.com/sasapay/callback",
+    }
+)
+
+otp_result = sasapay.process_payment(
+    {
+        "MerchantCode": "600980",
+        "CheckoutRequestID": request["CheckoutRequestID"],
+        "VerificationCode": "123456",
+    }
+)
+```
+
+### Send A B2C Payment
+
+```python
+response = sasapay.b2c_payment(
+    {
+        "MerchantCode": "600980",
+        "Amount": 10,
+        "Currency": "KES",
+        "MerchantTransactionReference": "B2C-001",
+        "ReceiverNumber": "254700000080",
+        "Channel": "63902",
+        "Reason": "Customer payout",
+        "CallBackURL": "https://example.com/sasapay/callback",
+    }
+)
+```
+
+### Send A B2B Payment
+
+```python
+response = sasapay.b2b_payment(
+    {
+        "MerchantCode": "600980",
+        "MerchantTransactionReference": "B2B-001",
+        "Currency": "KES",
+        "Amount": 12,
+        "ReceiverMerchantCode": "600981",
+        "AccountReference": "SETTLEMENT-001",
+        "ReceiverAccountType": "merchant",
+        "NetworkCode": "63902",
+        "Reason": "Merchant settlement",
+        "CallBackURL": "https://example.com/sasapay/callback",
+    }
+)
+```
+
+### Type Your Callback Handlers
+
+```python
+from noriapay import SasaPayC2BCallback, SasaPayC2BIpn, SasaPayTransferCallback
+
+
+def handle_c2b_callback(payload: SasaPayC2BCallback) -> None:
+    print(payload["CheckoutRequestID"], payload["ResultCode"])
+
+
+def handle_ipn(payload: SasaPayC2BIpn) -> None:
+    print(payload["TransID"], payload["TransAmount"])
+
+
+def handle_transfer_callback(payload: SasaPayTransferCallback) -> None:
+    print(payload.get("MerchantTransactionReference"))
+```
+
+### Async SasaPay
+
+```python
+from noriapay import AsyncSasaPayClient
+
+
+async def request_payment() -> None:
+    async with AsyncSasaPayClient.from_env() as sasapay:
+        response = await sasapay.request_payment(
+            {
+                "MerchantCode": "600980",
+                "NetworkCode": "63902",
+                "Currency": "KES",
+                "Amount": 1,
+                "PhoneNumber": "254700000080",
+                "AccountReference": "INV-001",
+                "TransactionDesc": "Invoice payment",
+                "CallBackURL": "https://example.com/sasapay/callback",
+            }
+        )
+        print(response["CheckoutRequestID"])
+```
+
+### SasaPay Notes
+
+- `SASAPAY_BASE_URL` is the sandbox default: `https://sandbox.sasapay.app/api/v1`
+- `environment="production"` is supported, but you must provide the live `base_url`
+- amount fields accept `str`, `int`, or `float`; the SDK serializes them to provider-compatible strings
+- you can provide `token_provider=` instead of `client_id` and `client_secret`
+- documented network behavior reviewed for this package:
+  - `NetworkCode="0"` is SasaPay wallet
+  - values such as `63902` represent external payment channels like M-PESA
+
+### SasaPay API Map
+
+```python
+SasaPayClient(
+    *,
+    client_id=None,
+    client_secret=None,
+    token_provider=None,
+    environment="sandbox",
+    base_url=None,
+    client=None,
+    session=None,
+    timeout_seconds=None,
+    token_cache_skew_seconds=60.0,
+    default_headers=None,
+    retry=None,
+    hooks=None,
+)
+
+SasaPayClient.from_env(
+    *,
+    prefix="SASAPAY_",
+    environ=None,
+    token_provider=None,
+    client=None,
+    session=None,
+    default_headers=None,
+    retry=None,
+    hooks=None,
+)
+
+sasapay.get_access_token(force_refresh=False)
+sasapay.request_payment(payload, options=None)
+sasapay.process_payment(payload, options=None)
+sasapay.b2c_payment(payload, options=None)
+sasapay.b2b_payment(payload, options=None)
+sasapay.close()
+```
+
+```python
+AsyncSasaPayClient(
+    *,
+    client_id=None,
+    client_secret=None,
+    token_provider=None,
+    environment="sandbox",
+    base_url=None,
+    client=None,
+    timeout_seconds=None,
+    token_cache_skew_seconds=60.0,
+    default_headers=None,
+    retry=None,
+    hooks=None,
+)
+
+AsyncSasaPayClient.from_env(
+    *,
+    prefix="SASAPAY_",
+    environ=None,
+    token_provider=None,
+    client=None,
+    default_headers=None,
+    retry=None,
+    hooks=None,
+)
+
+await sasapay.get_access_token(force_refresh=False)
+await sasapay.request_payment(payload, options=None)
+await sasapay.process_payment(payload, options=None)
+await sasapay.b2c_payment(payload, options=None)
+await sasapay.b2b_payment(payload, options=None)
+await sasapay.aclose()
+```
+
+### SasaPay Exported Models
+
+- `SasaPayAuthResponse`
+- `SasaPayRequestPaymentRequest`
+- `SasaPayRequestPaymentResponse`
+- `SasaPayProcessPaymentRequest`
+- `SasaPayProcessPaymentResponse`
+- `SasaPayB2CRequest`
+- `SasaPayB2CResponse`
+- `SasaPayB2BRequest`
+- `SasaPayB2BResponse`
+- `SasaPayC2BCallback`
+- `SasaPayC2BIpn`
+- `SasaPayTransferCallback`
+
+## Paystack Recipes
+
+### Create A Client
+
+```python
+from noriapay import PaystackClient
+
+paystack = PaystackClient.from_env()
+
+# or direct construction
+paystack = PaystackClient(secret_key="sk_test_xxx")
+```
+
+### Initialize A Checkout Transaction
+
+```python
+response = paystack.initialize_transaction(
+    {
+        "email": "customer@example.com",
+        "amount": 5000,
+        "currency": "KES",
+        "reference": "order-123",
+        "callback_url": "https://example.com/paystack/callback",
+        "metadata": {"order_id": "order-123"},
+    }
+)
+
+authorization_url = response["data"]["authorization_url"]
+reference = response["data"]["reference"]
+```
+
+Paystack amounts are lowest-unit integers. `5000` means `50.00` in a 2-decimal currency such as KES.
+
+### Verify A Transaction
+
+```python
+verification = paystack.verify_transaction("order-123")
+
+if verification["data"]["status"] == "success":
+    print("Payment confirmed")
+```
+
+### List Supported Banks
+
+```python
+banks = paystack.list_banks(
+    {
+        "country": "kenya",
+        "currency": "KES",
+        "type": "mobile_money",
+    }
+)
+```
+
+### Resolve An Account
+
+```python
+account = paystack.resolve_account(
+    account_number="247247",
+    bank_code="MPTILL",
+)
+
+print(account["data"]["account_name"])
+```
+
+### Create A Transfer Recipient
+
+```python
+recipient = paystack.create_transfer_recipient(
+    {
+        "type": "mobile_money_business",
+        "name": "Till Transfer Example",
+        "account_number": "247247",
+        "bank_code": "MPTILL",
+        "currency": "KES",
+        "description": "Settlement till",
+    }
+)
+
+recipient_code = recipient["data"]["recipient_code"]
+```
+
+### Initiate A Transfer
+
+```python
+transfer = paystack.initiate_transfer(
+    {
+        "source": "balance",
+        "amount": 5000,
+        "recipient": recipient_code,
+        "reference": "transfer-123",
+        "currency": "KES",
+        "reason": "Merchant settlement",
+        "account_reference": "ACC-123",
+    }
+)
+```
+
+### Finalize A Transfer
+
+```python
+result = paystack.finalize_transfer(
+    {
+        "transfer_code": "TRF_queued",
+        "otp": "123456",
+    }
+)
+```
+
+### Verify A Transfer
+
+```python
+verification = paystack.verify_transfer("transfer-123")
+```
+
+### Async Paystack
+
+```python
+from noriapay import AsyncPaystackClient
+
+
+async def initialize_checkout() -> None:
+    async with AsyncPaystackClient.from_env() as paystack:
+        response = await paystack.initialize_transaction(
+            {
+                "email": "customer@example.com",
+                "amount": 5000,
+                "reference": "order-123",
+                "currency": "KES",
+            }
+        )
+        print(response["data"]["authorization_url"])
+```
+
+### Verify Paystack Webhooks
+
+```python
+from noriapay import PAYSTACK_WEBHOOK_IPS, require_paystack_signature, require_source_ip
+
+
+def verify_paystack_webhook(raw_body: bytes, signature: str | None, source_ip: str | None) -> None:
+    require_paystack_signature(raw_body, signature, "sk_test_xxx")
+    require_source_ip(source_ip, PAYSTACK_WEBHOOK_IPS)
+```
+
+### Paystack Notes
+
+- `PAYSTACK_BASE_URL` is `https://api.paystack.co`
+- environment selection comes from the secret key you use
+- `RequestOptions.access_token` can override the bearer token on a single request
+- `PaystackClient` and `AsyncPaystackClient` do not use OAuth token lookup
+- this package currently covers the initial transaction and transfer subset described here
+
+### Paystack API Map
+
+```python
+PaystackClient(
+    *,
+    secret_key=None,
+    base_url=None,
+    client=None,
+    session=None,
+    timeout_seconds=None,
+    default_headers=None,
+    retry=None,
+    hooks=None,
+)
+
+PaystackClient.from_env(
+    *,
+    prefix="PAYSTACK_",
+    environ=None,
+    client=None,
+    session=None,
+    default_headers=None,
+    retry=None,
+    hooks=None,
+)
+
+paystack.initialize_transaction(payload, options=None)
+paystack.verify_transaction(reference, options=None)
+paystack.list_banks(query=None, options=None)
+paystack.resolve_account(account_number, bank_code, options=None)
+paystack.create_transfer_recipient(payload, options=None)
+paystack.initiate_transfer(payload, options=None)
+paystack.finalize_transfer(payload, options=None)
+paystack.verify_transfer(reference, options=None)
+paystack.close()
+```
+
+```python
+AsyncPaystackClient(
+    *,
+    secret_key=None,
+    base_url=None,
+    client=None,
+    timeout_seconds=None,
+    default_headers=None,
+    retry=None,
+    hooks=None,
+)
+
+AsyncPaystackClient.from_env(
+    *,
+    prefix="PAYSTACK_",
+    environ=None,
+    client=None,
+    default_headers=None,
+    retry=None,
+    hooks=None,
+)
+
+await paystack.initialize_transaction(payload, options=None)
+await paystack.verify_transaction(reference, options=None)
+await paystack.list_banks(query=None, options=None)
+await paystack.resolve_account(account_number, bank_code, options=None)
+await paystack.create_transfer_recipient(payload, options=None)
+await paystack.initiate_transfer(payload, options=None)
+await paystack.finalize_transfer(payload, options=None)
+await paystack.verify_transfer(reference, options=None)
+await paystack.aclose()
+```
+
+### Paystack Exported Models
+
+- `PaystackApiResponse`
+- `PaystackInitializeTransactionRequest`
+- `PaystackInitializeTransactionData`
+- `PaystackInitializeTransactionResponse`
+- `PaystackTransaction`
+- `PaystackVerifyTransactionResponse`
+- `PaystackBank`
+- `PaystackListBanksQuery`
+- `PaystackListBanksResponse`
+- `PaystackResolveAccountData`
+- `PaystackResolveAccountResponse`
+- `PaystackTransferRecipientDetails`
+- `PaystackTransferRecipient`
+- `PaystackCreateTransferRecipientRequest`
+- `PaystackCreateTransferRecipientResponse`
+- `PaystackTransfer`
+- `PaystackInitiateTransferRequest`
+- `PaystackInitiateTransferResponse`
+- `PaystackFinalizeTransferRequest`
+- `PaystackFinalizeTransferResponse`
+- `PaystackVerifyTransferResponse`
+
+Returned Paystack payloads also include nested objects such as authorization, customer, recipient details, and cursor metadata. Those nested shapes are part of the provider JSON returned by the SDK even when they are not exported as top-level public names.
+
+## Customization Recipes
+
+### Per-Request Overrides With `RequestOptions`
+
+```python
+from noriapay import RequestOptions
+
+result = mpesa.generate_qr_code(
+    {
+        "MerchantName": "Noria",
+        "MerchantShortCode": "174379",
+        "Amount": 40,
+        "QRType": "Dynamic",
+    },
+    options=RequestOptions(
+        headers={"x-request-id": "req-123"},
+        timeout_seconds=10,
+    ),
+)
+```
+
+For Paystack, `access_token` overrides the bearer token for one request:
+
+```python
+result = paystack.finalize_transfer(
+    {
+        "transfer_code": "TRF_queued",
+        "otp": "123456",
+    },
+    options=RequestOptions(
+        access_token="sk_test_override",
+        headers={"x-request-id": "req-123"},
+    ),
+)
+```
+
+For M-PESA and SasaPay, `force_token_refresh=True` forces a fresh OAuth lookup on that request:
+
+```python
+result = mpesa.stk_push(
+    payload,
+    options=RequestOptions(force_token_refresh=True),
+)
+```
+
+### Retries
+
+```python
+from noriapay import RetryPolicy
+
+retry = RetryPolicy(
+    max_attempts=3,
+    retry_methods=("GET", "POST"),
+    retry_on_statuses=(500, 502, 503, 504),
+    retry_on_network_error=True,
+    base_delay_seconds=0.25,
+    max_delay_seconds=2.0,
+    backoff_multiplier=2.0,
+)
+
+paystack = PaystackClient.from_env(retry=retry)
+```
+
+You can also attach retry rules per request:
+
+```python
+response = sasapay.request_payment(
+    payload,
+    options=RequestOptions(
+        retry=RetryPolicy(
+            max_attempts=2,
+            retry_methods=("POST",),
+            retry_on_statuses=(500,),
+        )
+    ),
+)
+```
+
+### Hooks
+
+```python
+from noriapay import Hooks, MpesaClient
+
+
+def before_request(context) -> None:
+    context.headers["x-trace-id"] = "trace-123"
+
+
+def after_response(context) -> None:
+    print(context.method, context.url, context.response_body)
+
+
+def on_error(context) -> None:
+    print("request failed", context.error)
+
+
+mpesa = MpesaClient.from_env(
+    hooks=Hooks(
+        before_request=before_request,
+        after_response=after_response,
+        on_error=on_error,
+    )
+)
+```
+
+Hook context objects are:
+
+- `BeforeRequestContext`
+- `AfterResponseContext`
+- `ErrorContext`
+
+### Inject Your Own `httpx` Client
+
+```python
+import httpx
+from noriapay import MpesaClient
+
+http_client = httpx.Client(
+    headers={"x-app-name": "billing-service"},
+    verify=True,
+)
+
+mpesa = MpesaClient.from_env(client=http_client)
+```
+
+Sync constructors accept `client=` and keep `session=` as a backward-compatible alias.
+
+Async example:
+
+```python
+import httpx
+from noriapay import AsyncPaystackClient
+
+http_client = httpx.AsyncClient(headers={"x-app-name": "billing-service"})
+paystack = AsyncPaystackClient.from_env(client=http_client)
+```
+
+### Use A Custom OAuth Token Provider
+
+`MpesaClient` and `SasaPayClient` can use any object that implements `get_access_token(force_refresh=False)`. The async clients accept an async version of the same contract.
+
+Using the built-in token providers directly:
+
+```python
+from noriapay import ClientCredentialsTokenProvider, MpesaClient
+
+provider = ClientCredentialsTokenProvider(
+    token_url="https://sandbox.safaricom.co.ke/oauth/v1/generate",
+    client_id="consumer-key",
+    client_secret="consumer-secret",
+    query={"grant_type": "client_credentials"},
+)
+
+mpesa = MpesaClient(token_provider=provider, environment="sandbox")
+```
+
+```python
+from noriapay import AsyncClientCredentialsTokenProvider, AsyncSasaPayClient
+
+provider = AsyncClientCredentialsTokenProvider(
+    token_url="https://sandbox.sasapay.app/api/v1/auth/token/",
+    client_id="client-id",
+    client_secret="client-secret",
+    query={"grant_type": "client_credentials"},
+)
+
+sasapay = AsyncSasaPayClient(
+    token_provider=provider,
+    environment="sandbox",
+)
+```
+
+### Error Handling
+
+```python
+from noriapay import (
+    ApiError,
+    AuthenticationError,
+    ConfigurationError,
+    NetworkError,
+    TimeoutError,
+    WebhookVerificationError,
+)
+
+try:
+    response = paystack.verify_transaction("order-123")
+except ConfigurationError:
+    ...
+except AuthenticationError:
+    ...
+except TimeoutError:
+    ...
+except NetworkError:
+    ...
+except ApiError as error:
+    print(error.status_code, error.response_body)
+except WebhookVerificationError:
+    ...
+```
+
+## Shared API Reference
+
+### Core Shared Types
+
+```python
+Environment = Literal["sandbox", "production"]
+
+class AccessTokenProvider(Protocol):
+    def get_access_token(self, force_refresh: bool = False) -> str: ...
+
+
+class AsyncAccessTokenProvider(Protocol):
+    async def get_access_token(self, force_refresh: bool = False) -> str: ...
+
+
+AccessToken(
+    access_token: str,
+    expires_in: int,
+    token_type: str | None = None,
+    scope: str | None = None,
+    raw: dict[str, Any] = {},
+)
+```
+
+### Request And Retry Types
+
+```python
+RequestOptions(
+    headers=None,
+    timeout_seconds=None,
+    retry=None,
+    access_token=None,
+    force_token_refresh=False,
+)
+
+RetryDecisionContext(
+    attempt: int,
+    max_attempts: int,
+    method: str,
+    url: str,
+    status: int | None = None,
+    error: object = None,
+)
+
+RetryPolicy(
+    max_attempts=1,
+    retry_methods=(),
+    retry_on_statuses=(),
+    retry_on_network_error=False,
+    base_delay_seconds=0.0,
+    max_delay_seconds=60.0,
+    backoff_multiplier=2.0,
+    should_retry=None,
+)
+```
+
+### Hooks
+
+```python
+Hooks(
+    before_request=None,
+    after_response=None,
+    on_error=None,
+)
+```
+
+`before_request`, `after_response`, and `on_error` each accept a single callable or a sequence of callables.
+
+### Built-In Token Providers
+
+```python
+ClientCredentialsTokenProvider(
+    token_url,
+    client_id,
+    client_secret,
+    client=None,
+    session=None,
+    timeout_seconds=None,
+    query=None,
+    cache_skew_seconds=60.0,
+    map_response=None,
+)
+
+provider.get_token(force_refresh=False)
+provider.get_access_token(force_refresh=False)
+provider.clear_cache()
+provider.close()
+```
+
+```python
+AsyncClientCredentialsTokenProvider(
+    token_url,
+    client_id,
+    client_secret,
+    client=None,
+    timeout_seconds=None,
+    query=None,
+    cache_skew_seconds=60.0,
+    map_response=None,
+)
+
+await provider.get_token(force_refresh=False)
+await provider.get_access_token(force_refresh=False)
+provider.clear_cache()
+await provider.aclose()
+```
+
+### Webhook Helpers
+
+```python
+PAYSTACK_WEBHOOK_IPS
+compute_paystack_signature(raw_body, secret_key)
+verify_paystack_signature(raw_body, signature, secret_key)
+require_paystack_signature(raw_body, signature, secret_key)
+verify_source_ip(source_ip, allowed_ips)
+require_source_ip(source_ip, allowed_ips)
+```
+
+### Exceptions
+
+- `NoriapayError`
+- `ConfigurationError`
+- `AuthenticationError`
+- `TimeoutError`
+- `NetworkError`
+- `ApiError`
+- `WebhookVerificationError`
 
 ## Public Export Index
-
-Everything in this section is exported by `from noriapay import ...`.
 
 ### Shared Exports
 
@@ -67,6 +1259,8 @@ Everything in this section is exported by `from noriapay import ...`.
 - `AccessTokenProvider`
 - `AfterResponseContext`
 - `ApiError`
+- `AsyncAccessTokenProvider`
+- `AsyncClientCredentialsTokenProvider`
 - `AuthenticationError`
 - `BeforeRequestContext`
 - `ClientCredentialsTokenProvider`
@@ -85,6 +1279,7 @@ Everything in this section is exported by `from noriapay import ...`.
 ### M-PESA Exports
 
 - `MPESA_BASE_URLS`
+- `AsyncMpesaClient`
 - `MpesaAccountBalanceRequest`
 - `MpesaApiResponse`
 - `MpesaB2BRequest`
@@ -102,7 +1297,8 @@ Everything in this section is exported by `from noriapay import ...`.
 
 ### SasaPay Exports
 
-- `SASAPAY_SANDBOX_BASE_URL`
+- `SASAPAY_BASE_URL`
+- `AsyncSasaPayClient`
 - `SasaPayAuthResponse`
 - `SasaPayB2BRequest`
 - `SasaPayB2BResponse`
@@ -120,6 +1316,7 @@ Everything in this section is exported by `from noriapay import ...`.
 ### Paystack Exports
 
 - `PAYSTACK_BASE_URL`
+- `AsyncPaystackClient`
 - `PaystackApiResponse`
 - `PaystackBank`
 - `PaystackClient`
@@ -152,99 +1349,25 @@ Everything in this section is exported by `from noriapay import ...`.
 - `verify_paystack_signature`
 - `verify_source_ip`
 
-## Quick Start
+## Live Sandbox Checks
 
-### M-PESA
+The package includes opt-in integration tests against live sandbox or test credentials.
 
-```python
-from noriapay import MpesaClient, build_mpesa_stk_password, build_mpesa_timestamp
-
-mpesa = MpesaClient(
-    consumer_key="consumer-key",
-    consumer_secret="consumer-secret",
-    environment="sandbox",
-)
-
-timestamp = build_mpesa_timestamp()
-
-response = mpesa.stk_push(
-    {
-        "BusinessShortCode": "174379",
-        "Password": build_mpesa_stk_password(
-            business_short_code="174379",
-            passkey="passkey",
-            timestamp=timestamp,
-        ),
-        "Timestamp": timestamp,
-        "TransactionType": "CustomerPayBillOnline",
-        "Amount": 1,
-        "PartyA": "254700000000",
-        "PartyB": "174379",
-        "PhoneNumber": "254700000000",
-        "CallBackURL": "https://example.com/mpesa/callback",
-        "AccountReference": "INV-001",
-        "TransactionDesc": "Payment",
-    }
-)
+```bash
+export RUN_LIVE_SANDBOX_TESTS=1
+uv run pytest -m integration
 ```
 
-### SasaPay
+Credentials expected by the integration suite:
 
-```python
-from noriapay import SasaPayClient
+- M-PESA: `MPESA_CONSUMER_KEY`, `MPESA_CONSUMER_SECRET`
+- SasaPay: `SASAPAY_CLIENT_ID`, `SASAPAY_CLIENT_SECRET`
+- Paystack: `PAYSTACK_SECRET_KEY`
 
-sasapay = SasaPayClient(
-    client_id="client-id",
-    client_secret="client-secret",
-    environment="sandbox",
-)
+Use test or sandbox credentials only.
 
-response = sasapay.request_payment(
-    {
-        "MerchantCode": "600980",
-        "NetworkCode": "63902",
-        "Currency": "KES",
-        "Amount": "1.00",
-        "PhoneNumber": "254700000080",
-        "AccountReference": "12345678",
-        "TransactionDesc": "Request Payment",
-        "CallBackURL": "https://example.com/sasapay/callback",
-    }
-)
-```
+## Provider Docs
 
-### Paystack
-
-```python
-from noriapay import PaystackClient
-
-paystack = PaystackClient(secret_key="sk_test_xxx")
-
-response = paystack.initialize_transaction(
-    {
-        "email": "customer@example.com",
-        "amount": 5000,
-        "reference": "order-123",
-        "callback_url": "https://example.com/paystack/callback",
-    }
-)
-```
-
-### Environment-Based Setup
-
-```python
-from noriapay import MpesaClient, PaystackClient, SasaPayClient
-
-mpesa = MpesaClient.from_env()
-sasapay = SasaPayClient.from_env()
-paystack = PaystackClient.from_env()
-```
-
-## Source Docs
-
-This package was implemented against:
-
-- local Daraja reference: `../daraja.md`
 - SasaPay getting started: <https://developer.sasapay.app/docs/getting-started>
 - SasaPay authentication: <https://developer.sasapay.app/docs/apis/authentication>
 - SasaPay C2B: <https://developer.sasapay.app/docs/apis/c2b>
@@ -254,1263 +1377,11 @@ This package was implemented against:
 - Paystack transfer recipient guide: <https://paystack.com/docs/transfers/creating-transfer-recipients/>
 - Paystack webhooks: <https://paystack.com/docs/payments/webhooks/>
 
-Important SasaPay note:
-
-- the sandbox host is explicitly documented and is the default
-- the reviewed docs did not clearly state the production API host, so this package requires an explicit `base_url` for SasaPay production
-
-## Shared Reference
-
-### `Environment`
-
-`Environment = Literal["sandbox", "production"]`
-
-Used by `MpesaClient` and `SasaPayClient`.
-
-### `AccessTokenProvider`
-
-Protocol:
-
-```python
-class AccessTokenProvider(Protocol):
-    def get_access_token(self, force_refresh: bool = False) -> str: ...
-```
-
-You can pass a custom implementation as `token_provider=` to `MpesaClient` or `SasaPayClient`.
-
-### `AccessToken`
-
-Dataclass fields:
-
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `access_token` | `str` | OAuth access token. |
-| `expires_in` | `int` | Token lifetime in seconds. |
-| `token_type` | `str \| None` | Optional provider token type. |
-| `scope` | `str \| None` | Optional provider scope string. |
-| `raw` | `dict[str, Any]` | Original parsed provider payload. |
-
-### `ClientCredentialsTokenProvider`
-
-Reusable OAuth client-credentials token provider.
-
-Constructor fields:
-
-| Field | Type | Default | Meaning |
-| --- | --- | --- | --- |
-| `token_url` | `str` | required | Token endpoint URL. |
-| `client_id` | `str` | required | OAuth client id. |
-| `client_secret` | `str` | required | OAuth client secret. |
-| `session` | `requests.Session \| compatible object \| None` | `None` | Custom HTTP session. |
-| `timeout_seconds` | `float \| None` | `None` | Token request timeout. |
-| `query` | `dict[str, str \| int \| float \| bool \| None] \| None` | `None` | Optional query params. |
-| `cache_skew_seconds` | `float` | `60.0` | Refresh early before expiry. |
-| `map_response` | `Callable[[dict[str, Any]], AccessToken] \| None` | `None` | Custom token mapper. |
-
-Methods:
-
-| Method | Returns | Meaning |
-| --- | --- | --- |
-| `get_access_token(force_refresh=False)` | `str` | Returns a token string. |
-| `get_token(force_refresh=False)` | `AccessToken` | Returns the structured token object. |
-| `clear_cache()` | `None` | Clears the cached token. |
-
-Behavior:
-
-- creates its own `requests.Session()` if `session` is not supplied
-- caches tokens in memory
-- wraps timeout and request failures as `AuthenticationError`
-
-### `RequestOptions`
-
-Per-request overrides supported by client methods.
-
-| Field | Type | Default | Meaning |
-| --- | --- | --- | --- |
-| `headers` | `Mapping[str, str] \| None` | `None` | Extra headers for the request. |
-| `timeout_seconds` | `float \| None` | `None` | Request-specific timeout. |
-| `retry` | `RetryPolicy \| bool \| None` | `None` | Override retry behavior. Use `False` to disable inherited retry. |
-| `access_token` | `str \| None` | `None` | Override the bearer token for M-PESA and SasaPay, or the secret key for Paystack. |
-| `force_token_refresh` | `bool` | `False` | Forces the next OAuth token lookup to refresh for M-PESA and SasaPay. |
-
-Paystack note:
-
-- `force_token_refresh` has no practical effect because `PaystackClient` does not use OAuth token lookup
-
-### `RetryDecisionContext`
-
-Dataclass fields:
-
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `attempt` | `int` | Current attempt number, starting at `1`. |
-| `max_attempts` | `int` | Total configured attempts. |
-| `method` | `HttpMethod` | HTTP method. |
-| `url` | `str` | Absolute request URL. |
-| `status` | `int \| None` | HTTP status code for failed responses. |
-| `error` | `object` | Wrapped exception object when the failure is not an HTTP status failure. |
-
-### `RetryPolicy`
-
-Dataclass fields:
-
-| Field | Type | Default | Meaning |
-| --- | --- | --- | --- |
-| `max_attempts` | `int` | `1` | Total attempts including the first request. |
-| `retry_methods` | `tuple[HttpMethod, ...]` | `()` | Restrict retries to specific methods. |
-| `retry_on_statuses` | `tuple[int, ...]` | `()` | Retry these HTTP status codes. |
-| `retry_on_network_error` | `bool` | `False` | Retry timeouts and request exceptions. |
-| `base_delay_seconds` | `float` | `0.0` | Base retry delay. |
-| `max_delay_seconds` | `float` | `60.0` | Maximum retry delay. |
-| `backoff_multiplier` | `float` | `2.0` | Exponential backoff multiplier. |
-| `should_retry` | `Callable[[RetryDecisionContext], bool] \| None` | `None` | Final custom retry decision hook. |
-
-Retries are opt-in by default. That is deliberate for payments.
-
-### Hook Context Types
-
-#### `BeforeRequestContext`
-
-| Field | Type |
-| --- | --- |
-| `url` | `str` |
-| `path` | `str` |
-| `method` | `HttpMethod` |
-| `headers` | `MutableMapping[str, str]` |
-| `body` | `object` |
-| `attempt` | `int` |
-
-#### `AfterResponseContext`
-
-`AfterResponseContext` includes all `BeforeRequestContext` fields plus:
-
-| Field | Type |
-| --- | --- |
-| `response` | `object` |
-| `response_body` | `object` |
-
-#### `ErrorContext`
-
-`ErrorContext` includes all `BeforeRequestContext` fields plus:
-
-| Field | Type |
-| --- | --- |
-| `error` | `object` |
-| `response` | `object \| None` |
-| `response_body` | `object \| None` |
-
-### `Hooks`
-
-Dataclass fields:
-
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `before_request` | `Callable[[BeforeRequestContext], None] \| Sequence[Callable[[BeforeRequestContext], None]] \| None` | Observe or mutate outgoing headers/body before dispatch. |
-| `after_response` | `Callable[[AfterResponseContext], None] \| Sequence[Callable[[AfterResponseContext], None]] \| None` | Observe parsed responses. |
-| `on_error` | `Callable[[ErrorContext], None] \| Sequence[Callable[[ErrorContext], None]] \| None` | Observe wrapped failures and unsuccessful responses. |
-
-Header merge order:
-
-1. client `default_headers`
-2. per-request `RequestOptions.headers`
-3. SDK auth headers
-4. `before_request` hook mutations
-
-Example:
-
-```python
-from noriapay import Hooks, MpesaClient
-
-def before_request(context):
-    context.headers["x-correlation-id"] = "corr-123"
-
-client = MpesaClient(
-    consumer_key="consumer-key",
-    consumer_secret="consumer-secret",
-    hooks=Hooks(before_request=before_request),
-)
-```
-
-### Exception Classes
-
-All package exceptions inherit from `NoriapayError`.
-
-#### `NoriapayError`
-
-Base exception attributes:
-
-| Attribute | Type |
-| --- | --- |
-| `code` | `str` |
-| `details` | `object` |
-
-#### `ConfigurationError`
-
-Raised for invalid package or provider configuration.
-
-#### `AuthenticationError`
-
-Raised for OAuth token acquisition failures.
-
-#### `TimeoutError`
-
-Raised when the underlying HTTP request times out.
-
-#### `NetworkError`
-
-Raised for non-timeout request exceptions.
-
-#### `ApiError`
-
-Raised for non-2xx provider responses.
-
-Additional attributes:
-
-| Attribute | Type |
-| --- | --- |
-| `status_code` | `int` |
-| `response_body` | `object` |
-
-#### `WebhookVerificationError`
-
-Raised by webhook verification helpers when signature or source validation fails.
-
-## Environment Configuration
-
-Every client exposes a `from_env()` constructor.
-
-Shared `from_env()` behavior:
-
-- `environ` defaults to `os.environ`
-- blank env values are treated as missing
-- `*_TIMEOUT_SECONDS` and `*_TOKEN_CACHE_SKEW_SECONDS` are parsed as floats
-- `*_ENVIRONMENT` must be `sandbox` or `production`
-
-### `MpesaClient.from_env()`
-
-Signature:
-
-```python
-MpesaClient.from_env(
-    *,
-    prefix: str = "NORIAPAY_MPESA_",
-    environ: Mapping[str, str] | None = None,
-    token_provider: AccessTokenProvider | None = None,
-    session: requests.Session | compatible object | None = None,
-    default_headers: dict[str, str] | None = None,
-    retry: RetryPolicy | None = None,
-    hooks: Hooks | None = None,
-)
-```
-
-Environment variables:
-
-- `NORIAPAY_MPESA_CONSUMER_KEY`
-- `NORIAPAY_MPESA_CONSUMER_SECRET`
-- `NORIAPAY_MPESA_ENVIRONMENT`
-- `NORIAPAY_MPESA_BASE_URL`
-- `NORIAPAY_MPESA_TIMEOUT_SECONDS`
-- `NORIAPAY_MPESA_TOKEN_CACHE_SKEW_SECONDS`
-
-If `token_provider` is supplied, `CONSUMER_KEY` and `CONSUMER_SECRET` are not required.
-
-### `SasaPayClient.from_env()`
-
-Signature:
-
-```python
-SasaPayClient.from_env(
-    *,
-    prefix: str = "NORIAPAY_SASAPAY_",
-    environ: Mapping[str, str] | None = None,
-    token_provider: AccessTokenProvider | None = None,
-    session: requests.Session | compatible object | None = None,
-    default_headers: dict[str, str] | None = None,
-    retry: RetryPolicy | None = None,
-    hooks: Hooks | None = None,
-)
-```
-
-Environment variables:
-
-- `NORIAPAY_SASAPAY_CLIENT_ID`
-- `NORIAPAY_SASAPAY_CLIENT_SECRET`
-- `NORIAPAY_SASAPAY_ENVIRONMENT`
-- `NORIAPAY_SASAPAY_BASE_URL`
-- `NORIAPAY_SASAPAY_TIMEOUT_SECONDS`
-- `NORIAPAY_SASAPAY_TOKEN_CACHE_SKEW_SECONDS`
-
-If `token_provider` is supplied, `CLIENT_ID` and `CLIENT_SECRET` are not required.
-
-### `PaystackClient.from_env()`
-
-Signature:
-
-```python
-PaystackClient.from_env(
-    *,
-    prefix: str = "NORIAPAY_PAYSTACK_",
-    environ: Mapping[str, str] | None = None,
-    session: requests.Session | compatible object | None = None,
-    default_headers: Mapping[str, str] | None = None,
-    retry: RetryPolicy | None = None,
-    hooks: Hooks | None = None,
-)
-```
-
-Environment variables:
-
-- `NORIAPAY_PAYSTACK_SECRET_KEY`
-- `NORIAPAY_PAYSTACK_BASE_URL`
-- `NORIAPAY_PAYSTACK_TIMEOUT_SECONDS`
-
-For all three clients, you can change the env var prefix by passing `prefix="MYAPP_PAYMENTS_"`.
-
-## Webhook Verification Helpers
-
-### `PAYSTACK_WEBHOOK_IPS`
-
-Tuple of Paystack webhook source IPs currently hardcoded by the package:
-
-- `52.31.139.75`
-- `52.49.173.169`
-- `52.214.14.220`
-
-### `compute_paystack_signature(raw_body, secret_key)`
-
-Computes the lowercase hex SHA-512 HMAC digest used for Paystack webhook verification.
-
-Arguments:
-
-| Argument | Type |
-| --- | --- |
-| `raw_body` | `bytes \| str` |
-| `secret_key` | `str` |
-
-Returns: `str`
-
-### `verify_paystack_signature(raw_body, signature, secret_key)`
-
-Validates a supplied Paystack signature.
-
-Arguments:
-
-| Argument | Type |
-| --- | --- |
-| `raw_body` | `bytes \| str` |
-| `signature` | `str \| None` |
-| `secret_key` | `str` |
-
-Returns: `bool`
-
-### `require_paystack_signature(raw_body, signature, secret_key)`
-
-Same inputs as `verify_paystack_signature`, but raises `WebhookVerificationError` on failure.
-
-### `verify_source_ip(source_ip, allowed_ips)`
-
-Generic helper for source-IP allowlisting.
-
-Arguments:
-
-| Argument | Type |
-| --- | --- |
-| `source_ip` | `str \| None` |
-| `allowed_ips` | `Collection[str]` |
-
-Returns: `bool`
-
-Behavior:
-
-- strips whitespace from the incoming IP
-- strips blank values from the allowlist
-
-### `require_source_ip(source_ip, allowed_ips)`
-
-Same inputs as `verify_source_ip`, but raises `WebhookVerificationError` on failure.
-
-Example:
-
-```python
-from noriapay import PAYSTACK_WEBHOOK_IPS, require_paystack_signature, require_source_ip
-
-raw_body = request.get_data()
-signature = request.headers.get("x-paystack-signature")
-source_ip = request.headers.get("x-forwarded-for", request.remote_addr)
-
-require_paystack_signature(raw_body, signature, secret_key="sk_live_xxx")
-require_source_ip(source_ip, PAYSTACK_WEBHOOK_IPS)
-```
-
-M-PESA and SasaPay note:
-
-- the reviewed Daraja and SasaPay sources used for this package did not clearly document a signed webhook header scheme
-- for those providers, use HTTPS, correlate callbacks with your own identifiers, and verify final state with follow-up API queries where appropriate
-
-## M-PESA Reference
-
-### Constants and Helpers
-
-#### `MPESA_BASE_URLS`
-
-```python
-{
-    "sandbox": "https://sandbox.safaricom.co.ke",
-    "production": "https://api.safaricom.co.ke",
-}
-```
-
-#### `build_mpesa_timestamp(dt=None)`
-
-Formats a `datetime` as `YYYYMMDDHHMMSS`.
-
-Arguments:
-
-| Argument | Type | Default |
-| --- | --- | --- |
-| `dt` | `datetime \| None` | `None` |
-
-Returns: `str`
-
-#### `build_mpesa_stk_password(business_short_code, passkey, timestamp)`
-
-Returns `base64(shortCode + passkey + timestamp)`.
-
-Arguments:
-
-| Argument | Type |
-| --- | --- |
-| `business_short_code` | `str` |
-| `passkey` | `str` |
-| `timestamp` | `str` |
-
-Returns: `str`
-
-### `MpesaClient`
-
-Constructor:
-
-```python
-MpesaClient(
-    *,
-    consumer_key: str | None = None,
-    consumer_secret: str | None = None,
-    token_provider: AccessTokenProvider | None = None,
-    environment: Environment = "sandbox",
-    base_url: str | None = None,
-    session: requests.Session | compatible object | None = None,
-    timeout_seconds: float | None = None,
-    token_cache_skew_seconds: float = 60.0,
-    default_headers: dict[str, str] | None = None,
-    retry: RetryPolicy | None = None,
-    hooks: Hooks | None = None,
-)
-```
-
-Auth modes:
-
-| Mode | Required |
-| --- | --- |
-| Built-in OAuth | `consumer_key`, `consumer_secret` |
-| External token provider | `token_provider` |
-
-Notes:
-
-- `environment="production"` uses `https://api.safaricom.co.ke`
-- `base_url` overrides the environment-derived base URL
-- `Amount` fields are serialized to strings before dispatch
-
-Methods:
-
-| Method | Returns | Endpoint |
-| --- | --- | --- |
-| `from_env(...)` | `MpesaClient` | env-based constructor |
-| `get_access_token(force_refresh=False)` | `str` | `GET /oauth/v1/generate?grant_type=client_credentials` |
-| `stk_push(payload, options=None)` | `MpesaStkPushResponse` | `POST /mpesa/stkpush/v1/processrequest` |
-| `stk_push_query(payload, options=None)` | `MpesaApiResponse` | `POST /mpesa/stkpushquery/v1/query` |
-| `register_c2b_urls(payload, version="v2", options=None)` | `MpesaApiResponse` | `POST /mpesa/c2b/v1/registerurl` or `v2` |
-| `b2c_payment(payload, options=None)` | `MpesaApiResponse` | `POST /mpesa/b2c/v1/paymentrequest` |
-| `b2b_payment(payload, options=None)` | `MpesaApiResponse` | `POST /mpesa/b2b/v1/paymentrequest` |
-| `reversal(payload, options=None)` | `MpesaApiResponse` | `POST /mpesa/reversal/v1/request` |
-| `transaction_status(payload, options=None)` | `MpesaApiResponse` | `POST /mpesa/transactionstatus/v1/query` |
-| `account_balance(payload, options=None)` | `MpesaApiResponse` | `POST /mpesa/accountbalance/v1/query` |
-| `generate_qr_code(payload, options=None)` | `MpesaApiResponse` | `POST /mpesa/qrcode/v1/generate` |
-
-### `MpesaApiResponse`
-
-Common response fields:
-
-| Field | Type |
-| --- | --- |
-| `ConversationID` | `str` |
-| `OriginatorConversationID` | `str` |
-| `ResponseCode` | `str` |
-| `ResponseDescription` | `str` |
-| `CustomerMessage` | `str` |
-| `errorCode` | `str` |
-| `errorMessage` | `str` |
-
-### `MpesaStkPushRequest`
-
-| Field | Type | Required |
-| --- | --- | --- |
-| `BusinessShortCode` | `str` | Yes |
-| `Password` | `str` | Yes |
-| `Timestamp` | `str` | Yes |
-| `TransactionType` | `str` | Yes |
-| `Amount` | `str \| int \| float` | Yes |
-| `PartyA` | `str` | Yes |
-| `PartyB` | `str` | Yes |
-| `PhoneNumber` | `str` | Yes |
-| `CallBackURL` | `str` | Yes |
-| `AccountReference` | `str` | Yes |
-| `TransactionDesc` | `str` | Yes |
-
-### `MpesaStkPushResponse`
-
-Includes all `MpesaApiResponse` fields plus:
-
-| Field | Type |
-| --- | --- |
-| `MerchantRequestID` | `str` |
-| `CheckoutRequestID` | `str` |
-
-### `MpesaStkQueryRequest`
-
-| Field | Type | Required |
-| --- | --- | --- |
-| `BusinessShortCode` | `str` | Yes |
-| `Password` | `str` | Yes |
-| `Timestamp` | `str` | Yes |
-| `CheckoutRequestID` | `str` | Yes |
-
-### `MpesaRegisterC2BUrlsRequest`
-
-| Field | Type | Required |
-| --- | --- | --- |
-| `ShortCode` | `str` | Yes |
-| `ResponseType` | `str` | Yes |
-| `ConfirmationURL` | `str` | Yes |
-| `ValidationURL` | `str` | Yes |
-
-### `MpesaB2CRequest`
-
-| Field | Type | Required |
-| --- | --- | --- |
-| `InitiatorName` | `str` | Yes |
-| `SecurityCredential` | `str` | Yes |
-| `CommandID` | `str` | Yes |
-| `Amount` | `str \| int \| float` | Yes |
-| `PartyA` | `str` | Yes |
-| `PartyB` | `str` | Yes |
-| `Remarks` | `str` | Yes |
-| `QueueTimeOutURL` | `str` | Yes |
-| `ResultURL` | `str` | Yes |
-| `Occasion` | `str` | No |
-
-### `MpesaB2BRequest`
-
-| Field | Type | Required |
-| --- | --- | --- |
-| `Initiator` | `str` | Yes |
-| `SecurityCredential` | `str` | Yes |
-| `CommandID` | `str` | Yes |
-| `Amount` | `str \| int \| float` | Yes |
-| `PartyA` | `str` | Yes |
-| `PartyB` | `str` | Yes |
-| `Remarks` | `str` | Yes |
-| `AccountReference` | `str` | Yes |
-| `QueueTimeOutURL` | `str` | Yes |
-| `ResultURL` | `str` | Yes |
-
-### `MpesaReversalRequest`
-
-| Field | Type | Required |
-| --- | --- | --- |
-| `Initiator` | `str` | Yes |
-| `SecurityCredential` | `str` | Yes |
-| `CommandID` | `str` | Yes |
-| `TransactionID` | `str` | Yes |
-| `Amount` | `str \| int \| float` | Yes |
-| `ReceiverParty` | `str` | Yes |
-| `RecieverIdentifierType` | `str` | Yes |
-| `ResultURL` | `str` | Yes |
-| `QueueTimeOutURL` | `str` | Yes |
-| `Remarks` | `str` | Yes |
-| `Occasion` | `str` | No |
-
-### `MpesaTransactionStatusRequest`
-
-| Field | Type | Required |
-| --- | --- | --- |
-| `Initiator` | `str` | Yes |
-| `SecurityCredential` | `str` | Yes |
-| `CommandID` | `str` | Yes |
-| `TransactionID` | `str` | Yes |
-| `PartyA` | `str` | Yes |
-| `IdentifierType` | `str` | Yes |
-| `ResultURL` | `str` | Yes |
-| `QueueTimeOutURL` | `str` | Yes |
-| `Remarks` | `str` | Yes |
-| `Occasion` | `str` | No |
-
-### `MpesaAccountBalanceRequest`
-
-| Field | Type | Required |
-| --- | --- | --- |
-| `Initiator` | `str` | Yes |
-| `SecurityCredential` | `str` | Yes |
-| `CommandID` | `str` | Yes |
-| `PartyA` | `str` | Yes |
-| `IdentifierType` | `str` | Yes |
-| `ResultURL` | `str` | Yes |
-| `QueueTimeOutURL` | `str` | Yes |
-| `Remarks` | `str` | Yes |
-
-### `MpesaQrCodeRequest`
-
-| Field | Type | Required |
-| --- | --- | --- |
-| `MerchantName` | `str` | Yes |
-| `MerchantShortCode` | `str` | Yes |
-| `Amount` | `str \| int \| float` | Yes |
-| `QRType` | `str` | Yes |
-
-## SasaPay Reference
-
-### Constants
-
-#### `SASAPAY_SANDBOX_BASE_URL`
-
-`https://sandbox.sasapay.app/api/v1`
-
-### `SasaPayClient`
-
-Constructor:
-
-```python
-SasaPayClient(
-    *,
-    client_id: str | None = None,
-    client_secret: str | None = None,
-    token_provider: AccessTokenProvider | None = None,
-    environment: Environment = "sandbox",
-    base_url: str | None = None,
-    session: requests.Session | compatible object | None = None,
-    timeout_seconds: float | None = None,
-    token_cache_skew_seconds: float = 60.0,
-    default_headers: dict[str, str] | None = None,
-    retry: RetryPolicy | None = None,
-    hooks: Hooks | None = None,
-)
-```
-
-Auth modes:
-
-| Mode | Required |
-| --- | --- |
-| Built-in OAuth | `client_id`, `client_secret` |
-| External token provider | `token_provider` |
-
-Notes:
-
-- `environment="sandbox"` defaults to `SASAPAY_SANDBOX_BASE_URL`
-- `environment="production"` requires explicit `base_url` unless you override it yourself
-- `Amount` fields are serialized to strings before dispatch
-
-Methods:
-
-| Method | Returns | Endpoint |
-| --- | --- | --- |
-| `from_env(...)` | `SasaPayClient` | env-based constructor |
-| `get_access_token(force_refresh=False)` | `str` | `GET /auth/token/?grant_type=client_credentials` |
-| `request_payment(payload, options=None)` | `SasaPayRequestPaymentResponse` | `POST /payments/request-payment/` |
-| `process_payment(payload, options=None)` | `SasaPayProcessPaymentResponse` | `POST /payments/process-payment/` |
-| `b2c_payment(payload, options=None)` | `SasaPayB2CResponse` | `POST /payments/b2c/` |
-| `b2b_payment(payload, options=None)` | `SasaPayB2BResponse` | `POST /payments/b2b/` |
-
-### `SasaPayAuthResponse`
-
-| Field | Type |
-| --- | --- |
-| `status` | `bool` |
-| `detail` | `str` |
-| `access_token` | `str` |
-| `expires_in` | `int` |
-| `token_type` | `str` |
-| `scope` | `str` |
-
-### `SasaPayRequestPaymentRequest`
-
-| Field | Type | Required |
-| --- | --- | --- |
-| `MerchantCode` | `str` | Yes |
-| `NetworkCode` | `str` | Yes |
-| `Currency` | `str` | Yes |
-| `Amount` | `str \| int \| float` | Yes |
-| `PhoneNumber` | `str` | Yes |
-| `AccountReference` | `str` | Yes |
-| `TransactionDesc` | `str` | Yes |
-| `CallBackURL` | `str` | Yes |
-
-### `SasaPayRequestPaymentResponse`
-
-| Field | Type |
-| --- | --- |
-| `status` | `bool` |
-| `detail` | `str` |
-| `PaymentGateway` | `str` |
-| `MerchantRequestID` | `str` |
-| `CheckoutRequestID` | `str` |
-| `TransactionReference` | `str` |
-| `ResponseCode` | `str` |
-| `ResponseDescription` | `str` |
-| `CustomerMessage` | `str` |
-
-Network behavior from the reviewed docs:
-
-- `NetworkCode="0"` is SasaPay wallet and requires OTP completion with `process_payment()`
-- values such as `63902` are mobile money channels like M-PESA
-
-### `SasaPayProcessPaymentRequest`
-
-| Field | Type | Required |
-| --- | --- | --- |
-| `MerchantCode` | `str` | Yes |
-| `CheckoutRequestID` | `str` | Yes |
-| `VerificationCode` | `str` | Yes |
-
-### `SasaPayProcessPaymentResponse`
-
-| Field | Type |
-| --- | --- |
-| `status` | `bool` |
-| `detail` | `str` |
-
-### `SasaPayB2CRequest`
-
-| Field | Type | Required |
-| --- | --- | --- |
-| `MerchantCode` | `str` | Yes |
-| `Amount` | `str \| int \| float` | Yes |
-| `Currency` | `str` | Yes |
-| `MerchantTransactionReference` | `str` | Yes |
-| `ReceiverNumber` | `str` | Yes |
-| `Channel` | `str` | Yes |
-| `Reason` | `str` | Yes |
-| `CallBackURL` | `str` | Yes |
-
-### `SasaPayB2CResponse`
-
-| Field | Type |
-| --- | --- |
-| `status` | `bool` |
-| `detail` | `str` |
-| `B2CRequestID` | `str` |
-| `ConversationID` | `str` |
-| `OriginatorConversationID` | `str` |
-| `ResponseCode` | `str` |
-| `TransactionCharges` | `str` |
-| `ResponseDescription` | `str` |
-
-### `SasaPayB2BRequest`
-
-| Field | Type | Required |
-| --- | --- | --- |
-| `MerchantCode` | `str` | Yes |
-| `MerchantTransactionReference` | `str` | Yes |
-| `Currency` | `str` | Yes |
-| `Amount` | `str \| int \| float` | Yes |
-| `ReceiverMerchantCode` | `str` | Yes |
-| `AccountReference` | `str` | Yes |
-| `ReceiverAccountType` | `str` | Yes |
-| `NetworkCode` | `str` | Yes |
-| `Reason` | `str` | Yes |
-| `CallBackURL` | `str` | Yes |
-
-### `SasaPayB2BResponse`
-
-| Field | Type |
-| --- | --- |
-| `status` | `bool` |
-| `detail` | `str` |
-| `B2BRequestID` | `str` |
-| `ConversationID` | `str` |
-| `OriginatorConversationID` | `str` |
-| `TransactionCharges` | `str` |
-| `ResponseCode` | `str` |
-| `ResponseDescription` | `str` |
-
-### `SasaPayC2BCallback`
-
-| Field | Type |
-| --- | --- |
-| `MerchantRequestID` | `str` |
-| `CheckoutRequestID` | `str` |
-| `PaymentRequestID` | `str` |
-| `ResultCode` | `str` |
-| `ResultDesc` | `str` |
-| `SourceChannel` | `str` |
-| `TransAmount` | `str` |
-| `RequestedAmount` | `str` |
-| `Paid` | `bool` |
-| `BillRefNumber` | `str` |
-| `TransactionDate` | `str` |
-| `CustomerMobile` | `str` |
-| `TransactionCode` | `str` |
-| `ThirdPartyTransID` | `str` |
-
-### `SasaPayC2BIpn`
-
-| Field | Type |
-| --- | --- |
-| `MerchantCode` | `str` |
-| `BusinessShortCode` | `str` |
-| `InvoiceNumber` | `str` |
-| `PaymentMethod` | `str` |
-| `TransID` | `str` |
-| `ThirdPartyTransID` | `str` |
-| `FullName` | `str` |
-| `FirstName` | `str` |
-| `MiddleName` | `str` |
-| `LastName` | `str` |
-| `TransactionType` | `str` |
-| `MSISDN` | `str` |
-| `OrgAccountBalance` | `str` |
-| `TransAmount` | `str` |
-| `TransTime` | `str` |
-| `BillRefNumber` | `str` |
-
-### `SasaPayTransferCallback`
-
-| Field | Type | Required |
-| --- | --- | --- |
-| `MerchantCode` | `str` | No |
-| `DestinationChannel` | `str` | No |
-| `RecipientName` | `str` | No |
-| `RecipientAccountNumber` | `str` | No |
-| `ResultCode` | `str` | No |
-| `ResultDesc` | `str` | No |
-| `SourceChannel` | `str` | No |
-| `SasaPayTransactionCode` | `str` | No |
-| `CheckoutRequestID` | `str` | No |
-| `SasaPayTransactionID` | `str` | No |
-| `ThirdPartyTransactionCode` | `str` | No |
-| `TransactionAmount` | `str` | No |
-| `TransactionCharge` | `str` | No |
-| `TransactionCharges` | `str` | No |
-| `MerchantRequestID` | `str` | No |
-| `MerchantTransactionReference` | `str` | No |
-| `TransactionDate` | `str` | No |
-| `MerchantAccountBalance` | `str` | No |
-| `LinkedTransactionCode` | `str` | No |
-
-## Paystack Reference
-
-### Constants
-
-#### `PAYSTACK_BASE_URL`
-
-`https://api.paystack.co`
-
-Environment selection is determined by the secret key you use.
-
-### `PaystackClient`
-
-Constructor:
-
-```python
-PaystackClient(
-    *,
-    secret_key: str | None = None,
-    base_url: str | None = None,
-    session: requests.Session | compatible object | None = None,
-    timeout_seconds: float | None = None,
-    default_headers: Mapping[str, str] | None = None,
-    retry: RetryPolicy | None = None,
-    hooks: Hooks | None = None,
-)
-```
-
-Required:
-
-| Field | Type |
-| --- | --- |
-| `secret_key` | `str` |
-
-Notes:
-
-- `secret_key` is sent as `Authorization: Bearer ...`
-- `RequestOptions.access_token` overrides the secret key for a single request
-- transaction and transfer amounts are provider lowest-unit integers
-- the current package only covers the initial payment and transfer subset described here
-
-Methods:
-
-| Method | Returns | Endpoint |
-| --- | --- | --- |
-| `from_env(...)` | `PaystackClient` | env-based constructor |
-| `initialize_transaction(payload, options=None)` | `PaystackInitializeTransactionResponse` | `POST /transaction/initialize` |
-| `verify_transaction(reference, options=None)` | `PaystackVerifyTransactionResponse` | `GET /transaction/verify/:reference` |
-| `list_banks(query=None, options=None)` | `PaystackListBanksResponse` | `GET /bank` |
-| `resolve_account(account_number, bank_code, options=None)` | `PaystackResolveAccountResponse` | `GET /bank/resolve` |
-| `create_transfer_recipient(payload, options=None)` | `PaystackCreateTransferRecipientResponse` | `POST /transferrecipient` |
-| `initiate_transfer(payload, options=None)` | `PaystackInitiateTransferResponse` | `POST /transfer` |
-| `finalize_transfer(payload, options=None)` | `PaystackFinalizeTransferResponse` | `POST /transfer/finalize_transfer` |
-| `verify_transfer(reference, options=None)` | `PaystackVerifyTransferResponse` | `GET /transfer/verify/:reference` |
-
-### `PaystackApiResponse`
-
-Common response envelope fields:
-
-| Field | Type |
-| --- | --- |
-| `status` | `bool` |
-| `message` | `str` |
-
-### `PaystackInitializeTransactionRequest`
-
-| Field | Type | Required |
-| --- | --- | --- |
-| `amount` | `str \| int` | Yes |
-| `email` | `str` | Yes |
-| `channels` | `Sequence[Literal["card", "bank", "apple_pay", "ussd", "qr", "mobile_money", "bank_transfer", "eft", "capitec_pay", "payattitude"]]` | No |
-| `currency` | `str` | No |
-| `reference` | `str` | No |
-| `callback_url` | `str` | No |
-| `plan` | `str` | No |
-| `invoice_limit` | `int` | No |
-| `metadata` | `object` | No |
-| `split_code` | `str` | No |
-| `subaccount` | `str` | No |
-| `transaction_charge` | `int` | No |
-| `bearer` | `Literal["account", "subaccount"]` | No |
-
-### `PaystackInitializeTransactionData`
-
-| Field | Type |
-| --- | --- |
-| `authorization_url` | `str` |
-| `access_code` | `str` |
-| `reference` | `str` |
-
-### `PaystackInitializeTransactionResponse`
-
-Includes `PaystackApiResponse` plus:
-
-| Field | Type |
-| --- | --- |
-| `data` | `PaystackInitializeTransactionData` |
-
-### `PaystackTransaction`
-
-| Field | Type |
-| --- | --- |
-| `id` | `int` |
-| `domain` | `str` |
-| `status` | `str` |
-| `reference` | `str` |
-| `receipt_number` | `str \| None` |
-| `amount` | `int` |
-| `message` | `str \| None` |
-| `gateway_response` | `str` |
-| `paid_at` | `str` |
-| `created_at` | `str` |
-| `channel` | `str` |
-| `currency` | `str` |
-| `ip_address` | `str` |
-| `metadata` | `object` |
-| `log` | `object` |
-| `fees` | `int` |
-| `fees_split` | `object` |
-| `authorization` | `PaystackTransactionAuthorization` |
-| `customer` | `PaystackTransactionCustomer` |
-| `plan` | `object` |
-| `split` | `object` |
-| `order_id` | `object` |
-| `paidAt` | `str` |
-| `createdAt` | `str` |
-| `requested_amount` | `int` |
-| `pos_transaction_data` | `object` |
-| `source` | `object` |
-| `fees_breakdown` | `object` |
-| `connect` | `object` |
-| `transaction_date` | `str` |
-| `plan_object` | `object` |
-| `subaccount` | `object` |
-
-### `PaystackVerifyTransactionResponse`
-
-Includes `PaystackApiResponse` plus:
-
-| Field | Type |
-| --- | --- |
-| `data` | `PaystackTransaction` |
-
-### `PaystackTransactionAuthorization`
-
-Nested object inside `PaystackTransaction.authorization`.
-
-This type is part of the response model but is not exported directly.
-
-| Field | Type |
-| --- | --- |
-| `authorization_code` | `str` |
-| `bin` | `str` |
-| `last4` | `str` |
-| `exp_month` | `str` |
-| `exp_year` | `str` |
-| `channel` | `str` |
-| `card_type` | `str` |
-| `bank` | `str` |
-| `country_code` | `str` |
-| `brand` | `str` |
-| `reusable` | `bool` |
-| `signature` | `str` |
-| `account_name` | `str \| None` |
-
-### `PaystackTransactionCustomer`
-
-Nested object inside `PaystackTransaction.customer`.
-
-This type is part of the response model but is not exported directly.
-
-| Field | Type |
-| --- | --- |
-| `id` | `int` |
-| `first_name` | `str \| None` |
-| `last_name` | `str \| None` |
-| `email` | `str` |
-| `customer_code` | `str` |
-| `phone` | `str \| None` |
-| `metadata` | `object` |
-| `risk_action` | `str` |
-| `international_format_phone` | `str \| None` |
-
-### `PaystackBank`
-
-| Field | Type |
-| --- | --- |
-| `name` | `str` |
-| `slug` | `str` |
-| `code` | `str` |
-| `longcode` | `str` |
-| `gateway` | `str \| None` |
-| `pay_with_bank` | `bool` |
-| `active` | `bool` |
-| `is_deleted` | `bool \| None` |
-| `country` | `str` |
-| `currency` | `str` |
-| `type` | `str` |
-| `id` | `int` |
-| `createdAt` | `str` |
-| `updatedAt` | `str` |
-
-### `PaystackListBanksQuery`
-
-| Field | Type | Required |
-| --- | --- | --- |
-| `country` | `str` | No |
-| `use_cursor` | `bool` | No |
-| `perPage` | `int` | No |
-| `pay_with_bank_transfer` | `bool` | No |
-| `pay_with_bank` | `bool` | No |
-| `enabled_for_verification` | `bool` | No |
-| `next` | `str` | No |
-| `previous` | `str` | No |
-| `gateway` | `str` | No |
-| `type` | `str` | No |
-| `currency` | `str` | No |
-| `include_nip_sort_code` | `bool` | No |
-
-### `PaystackListBanksResponse`
-
-Includes `PaystackApiResponse` plus:
-
-| Field | Type |
-| --- | --- |
-| `data` | `list[PaystackBank]` |
-| `meta` | `PaystackCursorMeta` |
-
-### `PaystackCursorMeta`
-
-Nested object inside `PaystackListBanksResponse.meta`.
-
-This type is part of the response model but is not exported directly.
-
-| Field | Type |
-| --- | --- |
-| `total` | `int` |
-| `skipped` | `int` |
-| `perPage` | `int` |
-| `page` | `int` |
-| `pageCount` | `int` |
-| `next` | `str \| None` |
-| `previous` | `str \| None` |
-
-### `PaystackResolveAccountData`
-
-| Field | Type |
-| --- | --- |
-| `account_number` | `str` |
-| `account_name` | `str` |
-| `bank_id` | `int` |
-
-### `PaystackResolveAccountResponse`
-
-Includes `PaystackApiResponse` plus:
-
-| Field | Type |
-| --- | --- |
-| `data` | `PaystackResolveAccountData` |
-
-### `PaystackTransferRecipientDetails`
-
-| Field | Type |
-| --- | --- |
-| `authorization_code` | `str \| None` |
-| `account_number` | `str \| None` |
-| `account_name` | `str \| None` |
-| `bank_code` | `str \| None` |
-| `bank_name` | `str \| None` |
-
-### `PaystackTransferRecipient`
-
-| Field | Type |
-| --- | --- |
-| `active` | `bool` |
-| `createdAt` | `str` |
-| `currency` | `str` |
-| `description` | `str \| None` |
-| `domain` | `str` |
-| `email` | `str \| None` |
-| `id` | `int` |
-| `integration` | `int` |
-| `metadata` | `object` |
-| `name` | `str` |
-| `recipient_code` | `str` |
-| `type` | `str` |
-| `updatedAt` | `str` |
-| `is_deleted` | `bool` |
-| `isDeleted` | `bool` |
-| `details` | `PaystackTransferRecipientDetails` |
-
-### `PaystackCreateTransferRecipientRequest`
-
-| Field | Type | Required |
-| --- | --- | --- |
-| `type` | `Literal["authorization", "basa", "ghipss", "kepss", "mobile_money", "mobile_money_business", "nuban"]` | Yes |
-| `name` | `str` | Yes |
-| `account_number` | `str` | No |
-| `bank_code` | `str` | No |
-| `description` | `str` | No |
-| `currency` | `str` | No |
-| `authorization_code` | `str` | No |
-| `email` | `str` | No |
-| `metadata` | `object` | No |
-
-### `PaystackCreateTransferRecipientResponse`
-
-Includes `PaystackApiResponse` plus:
-
-| Field | Type |
-| --- | --- |
-| `data` | `PaystackTransferRecipient` |
-
-### `PaystackTransfer`
-
-| Field | Type |
-| --- | --- |
-| `transfersessionid` | `list[object]` |
-| `transfertrials` | `list[object]` |
-| `domain` | `str` |
-| `amount` | `int` |
-| `currency` | `str` |
-| `reference` | `str` |
-| `source` | `str` |
-| `source_details` | `object` |
-| `reason` | `str \| None` |
-| `status` | `str` |
-| `failures` | `object` |
-| `transfer_code` | `str` |
-| `titan_code` | `object` |
-| `transferred_at` | `str \| None` |
-| `id` | `int` |
-| `integration` | `int` |
-| `request` | `object` |
-| `recipient` | `object` |
-| `createdAt` | `str` |
-| `updatedAt` | `str` |
-
-### `PaystackInitiateTransferRequest`
-
-| Field | Type | Required |
-| --- | --- | --- |
-| `source` | `str` | Yes |
-| `amount` | `int` | Yes |
-| `recipient` | `str` | Yes |
-| `reference` | `str` | No |
-| `reason` | `str` | No |
-| `currency` | `str` | No |
-| `account_reference` | `str` | No |
-
-### `PaystackInitiateTransferResponse`
-
-Includes `PaystackApiResponse` plus:
-
-| Field | Type |
-| --- | --- |
-| `data` | `PaystackTransfer` |
-
-### `PaystackFinalizeTransferRequest`
-
-| Field | Type | Required |
-| --- | --- | --- |
-| `transfer_code` | `str` | Yes |
-| `otp` | `str` | Yes |
-
-### `PaystackFinalizeTransferResponse`
-
-Includes `PaystackApiResponse` plus:
-
-| Field | Type |
-| --- | --- |
-| `data` | `PaystackTransfer` |
-
-### `PaystackVerifyTransferResponse`
-
-Includes `PaystackApiResponse` plus:
-
-| Field | Type |
-| --- | --- |
-| `data` | `PaystackTransfer` |
-
-## Async and Validation Notes
-
-- many payment APIs are asynchronous even when the initial HTTP request succeeds
-- treat the initial response as accepted, queued, or processing unless the provider explicitly states final settlement
-- final outcomes may arrive through callbacks, IPNs, or follow-up query endpoints
-- the package uses type hints and `TypedDict` payload models for developer guidance
-- the package does not perform full runtime schema validation of request or response payloads
-- provider JSON is returned as parsed provider payloads
-
-## Live Sandbox Checks
-
-The test suite includes opt-in live tests in `tests/test_live_sandbox.py`.
-
-They are skipped by default. To run them:
-
-```bash
-export NORIAPAY_RUN_LIVE_SANDBOX_TESTS=1
-uv run pytest -m integration
-```
-
-Provide the relevant environment variables documented above before running them.
-
-For Paystack, use a test secret key, not a live key.
-
 ## Notes
 
-- the Python package is synchronous by design
-- for concurrent or async-heavy systems, wrap calls in your own worker pool or use a future async variant
-- request payloads accept numbers for `Amount`, but the SDK serializes them to provider-compatible strings where implemented
+- choose `MpesaClient`, `SasaPayClient`, and `PaystackClient` for blocking code paths
+- choose `AsyncMpesaClient`, `AsyncSasaPayClient`, and `AsyncPaystackClient` for `asyncio` applications
+- sync clients use `httpx.Client`; async clients use `httpx.AsyncClient`
+- sync constructors accept `client=` and also keep `session=` as a backward-compatible alias
+- provider JSON is returned as parsed Python data structures
+- the package uses `TypedDict` payload and response models for editor guidance, not full runtime schema validation

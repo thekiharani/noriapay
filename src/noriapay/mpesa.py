@@ -5,7 +5,7 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Any, NotRequired, Required, TypedDict
 
-import requests
+import httpx
 
 from .config import (
     get_env_environment,
@@ -14,10 +14,11 @@ from .config import (
     get_required_env,
 )
 from .exceptions import ConfigurationError
-from .http import HttpClient
-from .oauth import ClientCredentialsTokenProvider
+from .http import AsyncHttpClient, HttpClient
+from .oauth import AsyncClientCredentialsTokenProvider, ClientCredentialsTokenProvider
 from .types import (
     AccessTokenProvider,
+    AsyncAccessTokenProvider,
     Environment,
     Hooks,
     HttpRequestOptions,
@@ -151,11 +152,12 @@ class MpesaClient:
     def from_env(
         cls,
         *,
-        prefix: str = "NORIAPAY_MPESA_",
+        prefix: str = "MPESA_",
         environ: Mapping[str, str] | None = None,
         token_provider: AccessTokenProvider | None = None,
-        session: requests.Session | Any | None = None,
-        default_headers: dict[str, str] | None = None,
+        client: httpx.Client | Any | None = None,
+        session: httpx.Client | Any | None = None,
+        default_headers: Mapping[str, str] | None = None,
         retry: RetryPolicy | None = None,
         hooks: Hooks | None = None,
     ) -> MpesaClient:
@@ -173,6 +175,7 @@ class MpesaClient:
             token_provider=token_provider,
             environment=get_env_environment(f"{prefix}ENVIRONMENT", environ=environ),
             base_url=get_optional_env(f"{prefix}BASE_URL", environ=environ),
+            client=client,
             session=session,
             timeout_seconds=get_env_float(f"{prefix}TIMEOUT_SECONDS", environ=environ),
             token_cache_skew_seconds=(
@@ -191,17 +194,25 @@ class MpesaClient:
         token_provider: AccessTokenProvider | None = None,
         environment: Environment = "sandbox",
         base_url: str | None = None,
-        session: requests.Session | Any | None = None,
+        client: httpx.Client | Any | None = None,
+        session: httpx.Client | Any | None = None,
         timeout_seconds: float | None = None,
         token_cache_skew_seconds: float = 60.0,
-        default_headers: dict[str, str] | None = None,
+        default_headers: Mapping[str, str] | None = None,
         retry: RetryPolicy | None = None,
         hooks: Hooks | None = None,
     ) -> None:
+        resolved_client = _resolve_sync_client(client, session)
+        self._client = resolved_client
+        self._owns_client = False
+        if self._client is None:
+            self._client = httpx.Client()
+            self._owns_client = True
+
         resolved_base_url = base_url or MPESA_BASE_URLS[environment]
         self._http = HttpClient(
             base_url=resolved_base_url,
-            session=session,
+            client=self._client,
             timeout_seconds=timeout_seconds,
             default_headers=default_headers,
             retry=retry,
@@ -211,7 +222,7 @@ class MpesaClient:
             token_provider=token_provider,
             consumer_key=consumer_key,
             consumer_secret=consumer_secret,
-            session=session,
+            client=self._client,
             timeout_seconds=timeout_seconds,
             token_cache_skew_seconds=token_cache_skew_seconds,
             base_url=resolved_base_url,
@@ -299,6 +310,16 @@ class MpesaClient:
             options,
         )
 
+    def close(self) -> None:
+        if self._owns_client and self._client is not None:
+            self._client.close()
+
+    def __enter__(self) -> MpesaClient:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
+
     def _authorized_request(
         self,
         path: str,
@@ -313,7 +334,205 @@ class MpesaClient:
         headers["authorization"] = f"Bearer {access_token}"
         headers["accept"] = "application/json"
         return self._http.request(
-            options=HttpRequestOptions(
+            HttpRequestOptions(
+                path=path,
+                method="POST",
+                headers=headers,
+                body=payload,
+                timeout_seconds=request_options.timeout_seconds,
+                retry=request_options.retry,
+            )
+        )
+
+
+class AsyncMpesaClient:
+    @classmethod
+    def from_env(
+        cls,
+        *,
+        prefix: str = "MPESA_",
+        environ: Mapping[str, str] | None = None,
+        token_provider: AsyncAccessTokenProvider | None = None,
+        client: httpx.AsyncClient | Any | None = None,
+        default_headers: Mapping[str, str] | None = None,
+        retry: RetryPolicy | None = None,
+        hooks: Hooks | None = None,
+    ) -> AsyncMpesaClient:
+        return cls(
+            consumer_key=(
+                None
+                if token_provider is not None
+                else get_required_env(f"{prefix}CONSUMER_KEY", environ=environ)
+            ),
+            consumer_secret=(
+                None
+                if token_provider is not None
+                else get_required_env(f"{prefix}CONSUMER_SECRET", environ=environ)
+            ),
+            token_provider=token_provider,
+            environment=get_env_environment(f"{prefix}ENVIRONMENT", environ=environ),
+            base_url=get_optional_env(f"{prefix}BASE_URL", environ=environ),
+            client=client,
+            timeout_seconds=get_env_float(f"{prefix}TIMEOUT_SECONDS", environ=environ),
+            token_cache_skew_seconds=(
+                get_env_float(f"{prefix}TOKEN_CACHE_SKEW_SECONDS", environ=environ) or 60.0
+            ),
+            default_headers=default_headers,
+            retry=retry,
+            hooks=hooks,
+        )
+
+    def __init__(
+        self,
+        *,
+        consumer_key: str | None = None,
+        consumer_secret: str | None = None,
+        token_provider: AsyncAccessTokenProvider | None = None,
+        environment: Environment = "sandbox",
+        base_url: str | None = None,
+        client: httpx.AsyncClient | Any | None = None,
+        timeout_seconds: float | None = None,
+        token_cache_skew_seconds: float = 60.0,
+        default_headers: Mapping[str, str] | None = None,
+        retry: RetryPolicy | None = None,
+        hooks: Hooks | None = None,
+    ) -> None:
+        self._client = client
+        self._owns_client = False
+        if self._client is None:
+            self._client = httpx.AsyncClient()
+            self._owns_client = True
+
+        resolved_base_url = base_url or MPESA_BASE_URLS[environment]
+        self._http = AsyncHttpClient(
+            base_url=resolved_base_url,
+            client=self._client,
+            timeout_seconds=timeout_seconds,
+            default_headers=default_headers,
+            retry=retry,
+            hooks=hooks,
+        )
+        self._tokens = _resolve_async_mpesa_token_provider(
+            token_provider=token_provider,
+            consumer_key=consumer_key,
+            consumer_secret=consumer_secret,
+            client=self._client,
+            timeout_seconds=timeout_seconds,
+            token_cache_skew_seconds=token_cache_skew_seconds,
+            base_url=resolved_base_url,
+        )
+
+    async def get_access_token(self, force_refresh: bool = False) -> str:
+        return await self._tokens.get_access_token(force_refresh=force_refresh)
+
+    async def stk_push(
+        self,
+        payload: MpesaStkPushRequest,
+        options: RequestOptions | None = None,
+    ) -> MpesaStkPushResponse:
+        return await self._authorized_request(
+            "/mpesa/stkpush/v1/processrequest",
+            _with_amount(payload, ("Amount",)),
+            options,
+        )
+
+    async def stk_push_query(
+        self,
+        payload: MpesaStkQueryRequest,
+        options: RequestOptions | None = None,
+    ) -> MpesaApiResponse:
+        return await self._authorized_request("/mpesa/stkpushquery/v1/query", payload, options)
+
+    async def register_c2b_urls(
+        self,
+        payload: MpesaRegisterC2BUrlsRequest,
+        *,
+        version: str = "v2",
+        options: RequestOptions | None = None,
+    ) -> MpesaApiResponse:
+        return await self._authorized_request(
+            f"/mpesa/c2b/{version}/registerurl",
+            payload,
+            options,
+        )
+
+    async def b2c_payment(
+        self, payload: MpesaB2CRequest, options: RequestOptions | None = None
+    ) -> MpesaApiResponse:
+        return await self._authorized_request(
+            "/mpesa/b2c/v1/paymentrequest",
+            _with_amount(payload, ("Amount",)),
+            options,
+        )
+
+    async def b2b_payment(
+        self, payload: MpesaB2BRequest, options: RequestOptions | None = None
+    ) -> MpesaApiResponse:
+        return await self._authorized_request(
+            "/mpesa/b2b/v1/paymentrequest",
+            _with_amount(payload, ("Amount",)),
+            options,
+        )
+
+    async def reversal(
+        self, payload: MpesaReversalRequest, options: RequestOptions | None = None
+    ) -> MpesaApiResponse:
+        return await self._authorized_request(
+            "/mpesa/reversal/v1/request",
+            _with_amount(payload, ("Amount",)),
+            options,
+        )
+
+    async def transaction_status(
+        self,
+        payload: MpesaTransactionStatusRequest,
+        options: RequestOptions | None = None,
+    ) -> MpesaApiResponse:
+        return await self._authorized_request("/mpesa/transactionstatus/v1/query", payload, options)
+
+    async def account_balance(
+        self,
+        payload: MpesaAccountBalanceRequest,
+        options: RequestOptions | None = None,
+    ) -> MpesaApiResponse:
+        return await self._authorized_request("/mpesa/accountbalance/v1/query", payload, options)
+
+    async def generate_qr_code(
+        self,
+        payload: MpesaQrCodeRequest,
+        options: RequestOptions | None = None,
+    ) -> MpesaApiResponse:
+        return await self._authorized_request(
+            "/mpesa/qrcode/v1/generate",
+            _with_amount(payload, ("Amount",)),
+            options,
+        )
+
+    async def aclose(self) -> None:
+        if self._owns_client and self._client is not None:
+            await self._client.aclose()
+
+    async def __aenter__(self) -> AsyncMpesaClient:
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        await self.aclose()
+
+    async def _authorized_request(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        options: RequestOptions | None,
+    ) -> Any:
+        request_options = options or RequestOptions()
+        access_token = request_options.access_token or await self._tokens.get_access_token(
+            force_refresh=request_options.force_token_refresh
+        )
+        headers = dict(request_options.headers or {})
+        headers["authorization"] = f"Bearer {access_token}"
+        headers["accept"] = "application/json"
+        return await self._http.request(
+            HttpRequestOptions(
                 path=path,
                 method="POST",
                 headers=headers,
@@ -338,7 +557,7 @@ def _resolve_mpesa_token_provider(
     token_provider: AccessTokenProvider | None,
     consumer_key: str | None,
     consumer_secret: str | None,
-    session: requests.Session | Any | None,
+    client: httpx.Client | Any,
     timeout_seconds: float | None,
     token_cache_skew_seconds: float,
     base_url: str,
@@ -355,11 +574,49 @@ def _resolve_mpesa_token_provider(
         token_url=f"{base_url}/oauth/v1/generate",
         client_id=consumer_key,
         client_secret=consumer_secret,
-        session=session,
+        client=client,
         timeout_seconds=timeout_seconds,
         query={"grant_type": "client_credentials"},
         cache_skew_seconds=token_cache_skew_seconds,
     )
+
+
+def _resolve_async_mpesa_token_provider(
+    *,
+    token_provider: AsyncAccessTokenProvider | None,
+    consumer_key: str | None,
+    consumer_secret: str | None,
+    client: httpx.AsyncClient | Any,
+    timeout_seconds: float | None,
+    token_cache_skew_seconds: float,
+    base_url: str,
+) -> AsyncAccessTokenProvider:
+    if token_provider is not None:
+        return token_provider
+
+    if not consumer_key or not consumer_secret:
+        raise ConfigurationError(
+            "AsyncMpesaClient requires either consumer_key and consumer_secret, or token_provider."
+        )
+
+    return AsyncClientCredentialsTokenProvider(
+        token_url=f"{base_url}/oauth/v1/generate",
+        client_id=consumer_key,
+        client_secret=consumer_secret,
+        client=client,
+        timeout_seconds=timeout_seconds,
+        query={"grant_type": "client_credentials"},
+        cache_skew_seconds=token_cache_skew_seconds,
+    )
+
+
+def _resolve_sync_client(
+    client: httpx.Client | Any | None,
+    session: httpx.Client | Any | None,
+) -> httpx.Client | Any | None:
+    if client is not None and session is not None and client is not session:
+        raise ConfigurationError("Provide only one of client or session.")
+    return client if client is not None else session
 
 
 def _with_amount(payload: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:

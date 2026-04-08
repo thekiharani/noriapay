@@ -9,6 +9,7 @@ from .exceptions import (
 )
 from .mpesa import (
     MPESA_BASE_URLS,
+    AsyncMpesaClient,
     MpesaAccountBalanceRequest,
     MpesaApiResponse,
     MpesaB2BRequest,
@@ -24,9 +25,10 @@ from .mpesa import (
     build_mpesa_stk_password,
     build_mpesa_timestamp,
 )
-from .oauth import ClientCredentialsTokenProvider
+from .oauth import AsyncClientCredentialsTokenProvider, ClientCredentialsTokenProvider
 from .paystack import (
     PAYSTACK_BASE_URL,
+    AsyncPaystackClient,
     PaystackApiResponse,
     PaystackBank,
     PaystackClient,
@@ -51,7 +53,8 @@ from .paystack import (
     PaystackVerifyTransferResponse,
 )
 from .sasapay import (
-    SASAPAY_SANDBOX_BASE_URL,
+    SASAPAY_BASE_URL,
+    AsyncSasaPayClient,
     SasaPayAuthResponse,
     SasaPayB2BRequest,
     SasaPayB2BResponse,
@@ -70,6 +73,7 @@ from .types import (
     AccessToken,
     AccessTokenProvider,
     AfterResponseContext,
+    AsyncAccessTokenProvider,
     BeforeRequestContext,
     Environment,
     ErrorContext,
@@ -92,6 +96,11 @@ __all__ = [
     "AccessTokenProvider",
     "AfterResponseContext",
     "ApiError",
+    "AsyncAccessTokenProvider",
+    "AsyncClientCredentialsTokenProvider",
+    "AsyncMpesaClient",
+    "AsyncPaystackClient",
+    "AsyncSasaPayClient",
     "AuthenticationError",
     "BeforeRequestContext",
     "ClientCredentialsTokenProvider",
@@ -140,7 +149,7 @@ __all__ = [
     "RequestOptions",
     "RetryDecisionContext",
     "RetryPolicy",
-    "SASAPAY_SANDBOX_BASE_URL",
+    "SASAPAY_BASE_URL",
     "SasaPayAuthResponse",
     "SasaPayB2BRequest",
     "SasaPayB2BResponse",

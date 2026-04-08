@@ -3,11 +3,11 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal, NotRequired, Required, TypedDict
 
-import requests
+import httpx
 
 from .config import get_env_float, get_optional_env, get_required_env
 from .exceptions import ConfigurationError
-from .http import HttpClient
+from .http import AsyncHttpClient, HttpClient
 from .types import Hooks, HttpRequestOptions, RequestOptions, RetryPolicy
 
 PAYSTACK_BASE_URL = "https://api.paystack.co"
@@ -289,9 +289,10 @@ class PaystackClient:
     def from_env(
         cls,
         *,
-        prefix: str = "NORIAPAY_PAYSTACK_",
+        prefix: str = "PAYSTACK_",
         environ: Mapping[str, str] | None = None,
-        session: requests.Session | Any | None = None,
+        client: httpx.Client | Any | None = None,
+        session: httpx.Client | Any | None = None,
         default_headers: Mapping[str, str] | None = None,
         retry: RetryPolicy | None = None,
         hooks: Hooks | None = None,
@@ -299,6 +300,7 @@ class PaystackClient:
         return cls(
             secret_key=get_required_env(f"{prefix}SECRET_KEY", environ=environ),
             base_url=get_optional_env(f"{prefix}BASE_URL", environ=environ),
+            client=client,
             session=session,
             timeout_seconds=get_env_float(f"{prefix}TIMEOUT_SECONDS", environ=environ),
             default_headers=default_headers,
@@ -311,7 +313,8 @@ class PaystackClient:
         *,
         secret_key: str | None = None,
         base_url: str | None = None,
-        session: requests.Session | Any | None = None,
+        client: httpx.Client | Any | None = None,
+        session: httpx.Client | Any | None = None,
         timeout_seconds: float | None = None,
         default_headers: Mapping[str, str] | None = None,
         retry: RetryPolicy | None = None,
@@ -320,10 +323,17 @@ class PaystackClient:
         if not secret_key:
             raise ConfigurationError("PaystackClient requires secret_key.")
 
+        resolved_client = _resolve_sync_client(client, session)
+        self._client = resolved_client
+        self._owns_client = False
+        if self._client is None:
+            self._client = httpx.Client()
+            self._owns_client = True
+
         self._secret_key = secret_key
         self._http = HttpClient(
             base_url=base_url or PAYSTACK_BASE_URL,
-            session=session,
+            client=self._client,
             timeout_seconds=timeout_seconds,
             default_headers=default_headers,
             retry=retry,
@@ -429,6 +439,16 @@ class PaystackClient:
             options=options,
         )
 
+    def close(self) -> None:
+        if self._owns_client and self._client is not None:
+            self._client.close()
+
+    def __enter__(self) -> PaystackClient:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
+
     def _request(
         self,
         *,
@@ -454,3 +474,200 @@ class PaystackClient:
                 retry=request_options.retry,
             )
         )
+
+
+class AsyncPaystackClient:
+    @classmethod
+    def from_env(
+        cls,
+        *,
+        prefix: str = "PAYSTACK_",
+        environ: Mapping[str, str] | None = None,
+        client: httpx.AsyncClient | Any | None = None,
+        default_headers: Mapping[str, str] | None = None,
+        retry: RetryPolicy | None = None,
+        hooks: Hooks | None = None,
+    ) -> AsyncPaystackClient:
+        return cls(
+            secret_key=get_required_env(f"{prefix}SECRET_KEY", environ=environ),
+            base_url=get_optional_env(f"{prefix}BASE_URL", environ=environ),
+            client=client,
+            timeout_seconds=get_env_float(f"{prefix}TIMEOUT_SECONDS", environ=environ),
+            default_headers=default_headers,
+            retry=retry,
+            hooks=hooks,
+        )
+
+    def __init__(
+        self,
+        *,
+        secret_key: str | None = None,
+        base_url: str | None = None,
+        client: httpx.AsyncClient | Any | None = None,
+        timeout_seconds: float | None = None,
+        default_headers: Mapping[str, str] | None = None,
+        retry: RetryPolicy | None = None,
+        hooks: Hooks | None = None,
+    ) -> None:
+        if not secret_key:
+            raise ConfigurationError("AsyncPaystackClient requires secret_key.")
+
+        self._client = client
+        self._owns_client = False
+        if self._client is None:
+            self._client = httpx.AsyncClient()
+            self._owns_client = True
+
+        self._secret_key = secret_key
+        self._http = AsyncHttpClient(
+            base_url=base_url or PAYSTACK_BASE_URL,
+            client=self._client,
+            timeout_seconds=timeout_seconds,
+            default_headers=default_headers,
+            retry=retry,
+            hooks=hooks,
+        )
+
+    async def initialize_transaction(
+        self,
+        payload: PaystackInitializeTransactionRequest,
+        options: RequestOptions | None = None,
+    ) -> PaystackInitializeTransactionResponse:
+        return await self._request(
+            path="/transaction/initialize",
+            method="POST",
+            payload=dict(payload),
+            options=options,
+        )
+
+    async def verify_transaction(
+        self,
+        reference: str,
+        options: RequestOptions | None = None,
+    ) -> PaystackVerifyTransactionResponse:
+        return await self._request(
+            path=f"/transaction/verify/{reference}",
+            method="GET",
+            options=options,
+        )
+
+    async def list_banks(
+        self,
+        query: PaystackListBanksQuery | None = None,
+        options: RequestOptions | None = None,
+    ) -> PaystackListBanksResponse:
+        return await self._request(
+            path="/bank",
+            method="GET",
+            query=query,
+            options=options,
+        )
+
+    async def resolve_account(
+        self,
+        *,
+        account_number: str,
+        bank_code: str,
+        options: RequestOptions | None = None,
+    ) -> PaystackResolveAccountResponse:
+        return await self._request(
+            path="/bank/resolve",
+            method="GET",
+            query={
+                "account_number": account_number,
+                "bank_code": bank_code,
+            },
+            options=options,
+        )
+
+    async def create_transfer_recipient(
+        self,
+        payload: PaystackCreateTransferRecipientRequest,
+        options: RequestOptions | None = None,
+    ) -> PaystackCreateTransferRecipientResponse:
+        return await self._request(
+            path="/transferrecipient",
+            method="POST",
+            payload=dict(payload),
+            options=options,
+        )
+
+    async def initiate_transfer(
+        self,
+        payload: PaystackInitiateTransferRequest,
+        options: RequestOptions | None = None,
+    ) -> PaystackInitiateTransferResponse:
+        return await self._request(
+            path="/transfer",
+            method="POST",
+            payload=dict(payload),
+            options=options,
+        )
+
+    async def finalize_transfer(
+        self,
+        payload: PaystackFinalizeTransferRequest,
+        options: RequestOptions | None = None,
+    ) -> PaystackFinalizeTransferResponse:
+        return await self._request(
+            path="/transfer/finalize_transfer",
+            method="POST",
+            payload=dict(payload),
+            options=options,
+        )
+
+    async def verify_transfer(
+        self,
+        reference: str,
+        options: RequestOptions | None = None,
+    ) -> PaystackVerifyTransferResponse:
+        return await self._request(
+            path=f"/transfer/verify/{reference}",
+            method="GET",
+            options=options,
+        )
+
+    async def aclose(self) -> None:
+        if self._owns_client and self._client is not None:
+            await self._client.aclose()
+
+    async def __aenter__(self) -> AsyncPaystackClient:
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        await self.aclose()
+
+    async def _request(
+        self,
+        *,
+        path: str,
+        method: Literal["GET", "POST"],
+        options: RequestOptions | None,
+        query: Mapping[str, str | int | float | bool | None] | None = None,
+        payload: object = None,
+    ) -> Any:
+        request_options = options or RequestOptions()
+        secret_key = request_options.access_token or self._secret_key
+        headers = dict(request_options.headers or {})
+        headers["authorization"] = f"Bearer {secret_key}"
+        headers["accept"] = "application/json"
+        return await self._http.request(
+            HttpRequestOptions(
+                path=path,
+                method=method,
+                headers=headers,
+                query=query,
+                body=payload,
+                timeout_seconds=request_options.timeout_seconds,
+                retry=request_options.retry,
+            )
+        )
+
+
+def _resolve_sync_client(
+    client: httpx.Client | Any | None,
+    session: httpx.Client | Any | None,
+) -> httpx.Client | Any | None:
+    if client is not None and session is not None and client is not session:
+        raise ConfigurationError("Provide only one of client or session.")
+    return client if client is not None else session

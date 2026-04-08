@@ -13,6 +13,10 @@ class AccessTokenProvider(Protocol):
     def get_access_token(self, force_refresh: bool = False) -> str: ...
 
 
+class AsyncAccessTokenProvider(Protocol):
+    async def get_access_token(self, force_refresh: bool = False) -> str: ...
+
+
 @dataclass(slots=True)
 class RetryDecisionContext:
     attempt: int
@@ -58,28 +62,16 @@ class ErrorContext(BeforeRequestContext):
     response_body: object | None = None
 
 
-HookCallable = (
-    Callable[[BeforeRequestContext], None]
-    | Callable[[AfterResponseContext], None]
-    | Callable[[ErrorContext], None]
-)
+BeforeRequestHook = Callable[[BeforeRequestContext], None]
+AfterResponseHook = Callable[[AfterResponseContext], None]
+ErrorHook = Callable[[ErrorContext], None]
 
 
 @dataclass(slots=True)
 class Hooks:
-    before_request: (
-        Callable[[BeforeRequestContext], None]
-        | Sequence[Callable[[BeforeRequestContext], None]]
-        | None
-    ) = None
-    after_response: (
-        Callable[[AfterResponseContext], None]
-        | Sequence[Callable[[AfterResponseContext], None]]
-        | None
-    ) = None
-    on_error: Callable[[ErrorContext], None] | Sequence[Callable[[ErrorContext], None]] | None = (
-        None
-    )
+    before_request: BeforeRequestHook | Sequence[BeforeRequestHook] | None = None
+    after_response: AfterResponseHook | Sequence[AfterResponseHook] | None = None
+    on_error: ErrorHook | Sequence[ErrorHook] | None = None
 
 
 @dataclass(slots=True)

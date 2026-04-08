@@ -10,15 +10,13 @@ pytestmark = pytest.mark.integration
 
 
 def _require_live_test_mode() -> None:
-    if os.environ.get("NORIAPAY_RUN_LIVE_SANDBOX_TESTS") != "1":
-        pytest.skip("Live sandbox tests are disabled. Set NORIAPAY_RUN_LIVE_SANDBOX_TESTS=1.")
+    if os.environ.get("RUN_LIVE_SANDBOX_TESTS") != "1":
+        pytest.skip("Live sandbox tests are disabled. Set RUN_LIVE_SANDBOX_TESTS=1.")
 
 
 def test_mpesa_live_sandbox_access_token() -> None:
     _require_live_test_mode()
-    if not os.environ.get("NORIAPAY_MPESA_CONSUMER_KEY") or not os.environ.get(
-        "NORIAPAY_MPESA_CONSUMER_SECRET"
-    ):
+    if not os.environ.get("MPESA_CONSUMER_KEY") or not os.environ.get("MPESA_CONSUMER_SECRET"):
         pytest.skip("M-PESA sandbox credentials are not configured.")
 
     client = MpesaClient.from_env()
@@ -27,9 +25,7 @@ def test_mpesa_live_sandbox_access_token() -> None:
 
 def test_sasapay_live_sandbox_access_token() -> None:
     _require_live_test_mode()
-    if not os.environ.get("NORIAPAY_SASAPAY_CLIENT_ID") or not os.environ.get(
-        "NORIAPAY_SASAPAY_CLIENT_SECRET"
-    ):
+    if not os.environ.get("SASAPAY_CLIENT_ID") or not os.environ.get("SASAPAY_CLIENT_SECRET"):
         pytest.skip("SasaPay sandbox credentials are not configured.")
 
     client = SasaPayClient.from_env()
@@ -38,7 +34,7 @@ def test_sasapay_live_sandbox_access_token() -> None:
 
 def test_paystack_live_test_key_banks_lookup() -> None:
     _require_live_test_mode()
-    if not os.environ.get("NORIAPAY_PAYSTACK_SECRET_KEY"):
+    if not os.environ.get("PAYSTACK_SECRET_KEY"):
         pytest.skip("Paystack test secret key is not configured.")
 
     client = PaystackClient.from_env()

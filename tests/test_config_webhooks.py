@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any
+import asyncio
 
 import pytest
 
 from noriapay import (
     PAYSTACK_WEBHOOK_IPS,
+    SASAPAY_BASE_URL,
+    AsyncMpesaClient,
+    AsyncPaystackClient,
+    AsyncSasaPayClient,
     ConfigurationError,
     MpesaClient,
     PaystackClient,
@@ -25,36 +28,7 @@ from noriapay.config import (
     get_required_env,
     resolve_environ,
 )
-
-
-@dataclass(slots=True)
-class FakeResponse:
-    status_code: int
-    payload: Any
-    headers: dict[str, str] = field(default_factory=lambda: {"content-type": "application/json"})
-
-    @property
-    def ok(self) -> bool:
-        return 200 <= self.status_code < 300
-
-    def json(self) -> Any:
-        return self.payload
-
-    @property
-    def text(self) -> str:
-        return ""
-
-
-@dataclass(slots=True)
-class FakeSession:
-    responses: list[FakeResponse]
-    calls: list[dict[str, Any]] = field(default_factory=list)
-
-    def request(self, **kwargs: Any) -> FakeResponse:
-        self.calls.append(kwargs)
-        if not self.responses:
-            raise AssertionError("No fake responses left.")
-        return self.responses.pop(0)
+from tests.support import FakeAsyncClient, FakeSyncClient, make_json_response
 
 
 def test_config_helpers_handle_optional_required_and_typed_env_values() -> None:
@@ -83,61 +57,113 @@ def test_config_helpers_handle_optional_required_and_typed_env_values() -> None:
         get_env_environment("BAD_ENV", environ={"BAD_ENV": "staging"})
 
 
-def test_mpesa_client_from_env_reads_credentials_and_common_options() -> None:
-    session = FakeSession(
-        responses=[FakeResponse(200, {"access_token": "mpesa-token", "expires_in": 3600})]
+def test_sync_clients_from_env_read_credentials_and_common_options() -> None:
+    mpesa_client = FakeSyncClient(
+        responses=[make_json_response(200, {"access_token": "mpesa-token", "expires_in": 3600})]
     )
-    client = MpesaClient.from_env(
+    mpesa = MpesaClient.from_env(
         environ={
-            "NORIAPAY_MPESA_CONSUMER_KEY": "consumer-key",
-            "NORIAPAY_MPESA_CONSUMER_SECRET": "consumer-secret",
-            "NORIAPAY_MPESA_ENVIRONMENT": "production",
-            "NORIAPAY_MPESA_TIMEOUT_SECONDS": "12.5",
-            "NORIAPAY_MPESA_TOKEN_CACHE_SKEW_SECONDS": "30",
+            "MPESA_CONSUMER_KEY": "consumer-key",
+            "MPESA_CONSUMER_SECRET": "consumer-secret",
+            "MPESA_ENVIRONMENT": "production",
+            "MPESA_TIMEOUT_SECONDS": "12.5",
+            "MPESA_TOKEN_CACHE_SKEW_SECONDS": "30",
         },
-        session=session,
+        client=mpesa_client,
     )
+    assert mpesa.get_access_token() == "mpesa-token"
+    assert mpesa_client.calls[0]["url"] == "https://api.safaricom.co.ke/oauth/v1/generate"
+    assert mpesa_client.calls[0]["timeout"] == 12.5
 
-    assert client.get_access_token() == "mpesa-token"
-    assert session.calls[0]["url"] == "https://api.safaricom.co.ke/oauth/v1/generate"
-    assert session.calls[0]["timeout"] == 12.5
-
-
-def test_sasapay_client_from_env_supports_production_base_url() -> None:
-    session = FakeSession(
-        responses=[FakeResponse(200, {"access_token": "sasapay-token", "expires_in": 3600})]
+    sasapay_client = FakeSyncClient(
+        responses=[make_json_response(200, {"access_token": "sasapay-token", "expires_in": 3600})]
     )
-    client = SasaPayClient.from_env(
+    sasapay = SasaPayClient.from_env(
         environ={
-            "NORIAPAY_SASAPAY_CLIENT_ID": "client-id",
-            "NORIAPAY_SASAPAY_CLIENT_SECRET": "client-secret",
-            "NORIAPAY_SASAPAY_ENVIRONMENT": "production",
-            "NORIAPAY_SASAPAY_BASE_URL": "https://api.example.com/sasapay",
-            "NORIAPAY_SASAPAY_TIMEOUT_SECONDS": "20",
+            "SASAPAY_CLIENT_ID": "client-id",
+            "SASAPAY_CLIENT_SECRET": "client-secret",
+            "SASAPAY_ENVIRONMENT": "production",
+            "SASAPAY_BASE_URL": "https://api.example.com/sasapay",
+            "SASAPAY_TIMEOUT_SECONDS": "20",
         },
-        session=session,
+        client=sasapay_client,
     )
+    assert sasapay.get_access_token() == "sasapay-token"
+    assert sasapay_client.calls[0]["url"] == "https://api.example.com/sasapay/auth/token/"
+    assert sasapay_client.calls[0]["timeout"] == 20.0
 
-    assert client.get_access_token() == "sasapay-token"
-    assert session.calls[0]["url"] == "https://api.example.com/sasapay/auth/token/"
-    assert session.calls[0]["timeout"] == 20.0
-
-
-def test_paystack_client_from_env_reads_secret_key() -> None:
-    session = FakeSession(
-        responses=[FakeResponse(200, {"status": True, "message": "Banks", "data": []})]
+    paystack_client = FakeSyncClient(
+        responses=[make_json_response(200, {"status": True, "message": "Banks", "data": []})]
     )
-    client = PaystackClient.from_env(
+    paystack = PaystackClient.from_env(
         environ={
-            "NORIAPAY_PAYSTACK_SECRET_KEY": "sk_test_123",
-            "NORIAPAY_PAYSTACK_TIMEOUT_SECONDS": "9",
+            "PAYSTACK_SECRET_KEY": "sk_test_123",
+            "PAYSTACK_TIMEOUT_SECONDS": "9",
         },
-        session=session,
+        client=paystack_client,
     )
+    assert paystack.list_banks()["status"] is True
+    assert paystack_client.calls[0]["headers"]["authorization"] == "Bearer sk_test_123"
+    assert paystack_client.calls[0]["timeout"] == 9.0
 
-    assert client.list_banks()["status"] is True
-    assert session.calls[0]["headers"]["authorization"] == "Bearer sk_test_123"
-    assert session.calls[0]["timeout"] == 9.0
+
+def test_async_clients_from_env_read_credentials_and_common_options() -> None:
+    async def run() -> None:
+        mpesa_client = FakeAsyncClient(
+            responses=[make_json_response(200, {"access_token": "mpesa-token", "expires_in": 3600})]
+        )
+        mpesa = AsyncMpesaClient.from_env(
+            environ={
+                "MPESA_CONSUMER_KEY": "consumer-key",
+                "MPESA_CONSUMER_SECRET": "consumer-secret",
+                "MPESA_ENVIRONMENT": "production",
+                "MPESA_TIMEOUT_SECONDS": "12.5",
+                "MPESA_TOKEN_CACHE_SKEW_SECONDS": "30",
+            },
+            client=mpesa_client,
+        )
+        assert await mpesa.get_access_token() == "mpesa-token"
+        assert mpesa_client.calls[0]["url"] == "https://api.safaricom.co.ke/oauth/v1/generate"
+        assert mpesa_client.calls[0]["timeout"] == 12.5
+
+        sasapay_client = FakeAsyncClient(
+            responses=[
+                make_json_response(200, {"access_token": "sasapay-token", "expires_in": 3600})
+            ]
+        )
+        sasapay = AsyncSasaPayClient.from_env(
+            environ={
+                "SASAPAY_CLIENT_ID": "client-id",
+                "SASAPAY_CLIENT_SECRET": "client-secret",
+                "SASAPAY_ENVIRONMENT": "production",
+                "SASAPAY_BASE_URL": "https://api.example.com/sasapay",
+                "SASAPAY_TIMEOUT_SECONDS": "20",
+            },
+            client=sasapay_client,
+        )
+        assert await sasapay.get_access_token() == "sasapay-token"
+        assert sasapay_client.calls[0]["url"] == "https://api.example.com/sasapay/auth/token/"
+        assert sasapay_client.calls[0]["timeout"] == 20.0
+
+        paystack_client = FakeAsyncClient(
+            responses=[make_json_response(200, {"status": True, "message": "Banks", "data": []})]
+        )
+        paystack = AsyncPaystackClient.from_env(
+            environ={
+                "PAYSTACK_SECRET_KEY": "sk_test_123",
+                "PAYSTACK_TIMEOUT_SECONDS": "9",
+            },
+            client=paystack_client,
+        )
+        assert (await paystack.list_banks())["status"] is True
+        assert paystack_client.calls[0]["headers"]["authorization"] == "Bearer sk_test_123"
+        assert paystack_client.calls[0]["timeout"] == 9.0
+
+    asyncio.run(run())
+
+
+def test_sasapay_base_url_constant_is_public_sandbox_default() -> None:
+    assert SASAPAY_BASE_URL == "https://sandbox.sasapay.app/api/v1"
 
 
 def test_webhook_helpers_verify_signatures_and_source_ips() -> None:
